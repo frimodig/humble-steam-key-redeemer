@@ -1,5 +1,7 @@
 import requests
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.common.exceptions import WebDriverException
 from fuzzywuzzy import fuzz
 import steam.webauth as wa
@@ -15,6 +17,14 @@ from base64 import b64encode
 import atexit
 import signal
 from http.client import responses
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.firefox import GeckoDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    HAS_WEBDRIVER_MANAGER = True
+except ImportError:
+    HAS_WEBDRIVER_MANAGER = False
 
 #patch steam webauth for password feedback
 wa.getpass = pwinput
@@ -138,34 +148,219 @@ def process_quit(driver):
     signal.signal(signal.SIGTERM,quit_on_exit)
     signal.signal(signal.SIGINT,quit_on_exit)
 
-def get_headless_driver():
-    possibleDrivers = [(webdriver.Firefox,webdriver.FirefoxOptions),(webdriver.Chrome,webdriver.ChromeOptions)]
+# Browser detection configuration
+# Each entry: (name, type, paths) where type is 'chromium' or 'firefox'
+KNOWN_BROWSERS = [
+    ("Chrome", "chromium", [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",  # macOS
+        "/usr/bin/google-chrome",  # Linux
+        "/usr/bin/google-chrome-stable",  # Linux alternate
+        "C:/Program Files/Google/Chrome/Application/chrome.exe",  # Windows
+        "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",  # Windows x86
+    ]),
+    ("Brave", "chromium", [
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",  # macOS
+        "/usr/bin/brave-browser",  # Linux
+        "/usr/bin/brave",  # Linux alternate
+        "C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe",  # Windows
+    ]),
+    ("Edge", "chromium", [
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",  # macOS
+        "/usr/bin/microsoft-edge",  # Linux
+        "/usr/bin/microsoft-edge-stable",  # Linux alternate
+        "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",  # Windows
+        "C:/Program Files/Microsoft/Edge/Application/msedge.exe",  # Windows
+    ]),
+    ("Chromium", "chromium", [
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",  # macOS
+        "/usr/bin/chromium",  # Linux
+        "/usr/bin/chromium-browser",  # Linux alternate
+        "/snap/bin/chromium",  # Linux snap
+        "C:/Program Files/Chromium/Application/chrome.exe",  # Windows
+    ]),
+    ("Opera", "chromium", [
+        "/Applications/Opera.app/Contents/MacOS/Opera",  # macOS
+        "/usr/bin/opera",  # Linux
+        "C:/Program Files/Opera/launcher.exe",  # Windows
+    ]),
+    ("Vivaldi", "chromium", [
+        "/Applications/Vivaldi.app/Contents/MacOS/Vivaldi",  # macOS
+        "/usr/bin/vivaldi",  # Linux
+        "/usr/bin/vivaldi-stable",  # Linux alternate
+        "C:/Program Files/Vivaldi/Application/vivaldi.exe",  # Windows
+    ]),
+    ("Arc", "chromium", [
+        "/Applications/Arc.app/Contents/MacOS/Arc",  # macOS (Arc is macOS only currently)
+    ]),
+    ("Firefox", "firefox", [
+        "/Applications/Firefox.app/Contents/MacOS/firefox",  # macOS
+        "/usr/bin/firefox",  # Linux
+        "/snap/bin/firefox",  # Linux snap
+        "C:/Program Files/Mozilla Firefox/firefox.exe",  # Windows
+        "C:/Program Files (x86)/Mozilla Firefox/firefox.exe",  # Windows x86
+    ]),
+]
+
+
+def detect_browsers():
+    """Auto-detect installed browsers and return list of (name, type, path) tuples."""
+    detected = []
+    
+    # Check for custom browser path via environment variable
+    custom_path = os.environ.get("BROWSER_PATH")
+    if custom_path and os.path.exists(custom_path):
+        # Assume chromium-based for custom paths (most common)
+        browser_type = os.environ.get("BROWSER_TYPE", "chromium")
+        detected.append(("Custom", browser_type, custom_path))
+    
+    # Scan for known browsers
+    for name, browser_type, paths in KNOWN_BROWSERS:
+        for path in paths:
+            if os.path.exists(path):
+                detected.append((name, browser_type, path))
+                break  # Found this browser, move to next
+    
+    return detected
+
+
+def try_chromium_browser(name, binary_path, exceptions):
+    """Try to create a headless Chromium-based browser driver."""
     driver = None
-
-    exceptions = []
-    for d,opt in possibleDrivers:
+    
+    if HAS_WEBDRIVER_MANAGER:
         try:
-            options = opt()
-            if d == webdriver.Chrome:
-                options.add_argument("--headless=new")
+            options = webdriver.ChromeOptions()
+            options.add_argument("--headless=new")
+            if binary_path:
+                options.binary_location = binary_path
+            
+            # Use appropriate ChromeType for known browsers
+            if "brave" in name.lower():
+                chrome_type = ChromeType.BRAVE
+            elif "chromium" in name.lower():
+                chrome_type = ChromeType.CHROMIUM
             else:
-                options.add_argument("-headless")
-            driver = d(options=options)
-            process_quit(driver) # make sure driver closes when we close
+                chrome_type = ChromeType.GOOGLE
+            
+            service = ChromeService(ChromeDriverManager(chrome_type=chrome_type).install())
+            driver = webdriver.Chrome(service=service, options=options)
+            process_quit(driver)
             return driver
-        except WebDriverException as e:
-            exceptions.append(('chrome:' if d == webdriver.Chrome else 'firefox:',e))
-            continue
-    cls()
-    print("This script needs either Chrome or Firefox to be installed and the respective Web Driver for it to be configured (usually simplest is by placing it in the folder with the script)")
-    print("")
-    print("https://www.browserstack.com/guide/geckodriver-selenium-python")
-    print("")
-    print("Potential configuration hints:")
-    for browser,exception in exceptions:
-        print("")
-        print(browser,exception.msg)
+        except Exception as e:
+            exceptions.append((f'{name} (webdriver-manager):', e))
+    
+    # Fallback without webdriver-manager
+    try:
+        options = webdriver.ChromeOptions()
+        options.add_argument("--headless=new")
+        if binary_path:
+            options.binary_location = binary_path
+        driver = webdriver.Chrome(options=options)
+        process_quit(driver)
+        return driver
+    except Exception as e:
+        exceptions.append((f'{name} (fallback):', e))
+    
+    return None
 
+
+def try_firefox_browser(name, binary_path, exceptions):
+    """Try to create a headless Firefox browser driver."""
+    driver = None
+    
+    if HAS_WEBDRIVER_MANAGER:
+        try:
+            options = webdriver.FirefoxOptions()
+            options.add_argument("-headless")
+            if binary_path:
+                options.binary_location = binary_path
+            service = FirefoxService(GeckoDriverManager().install())
+            driver = webdriver.Firefox(service=service, options=options)
+            process_quit(driver)
+            return driver
+        except Exception as e:
+            exceptions.append((f'{name} (webdriver-manager):', e))
+    
+    # Fallback without webdriver-manager
+    try:
+        options = webdriver.FirefoxOptions()
+        options.add_argument("-headless")
+        if binary_path:
+            options.binary_location = binary_path
+        driver = webdriver.Firefox(options=options)
+        process_quit(driver)
+        return driver
+    except Exception as e:
+        exceptions.append((f'{name} (fallback):', e))
+    
+    return None
+
+
+def get_headless_driver():
+    """Get a headless browser driver, auto-detecting available browsers."""
+    exceptions = []
+    
+    # Detect installed browsers
+    detected_browsers = detect_browsers()
+    
+    if detected_browsers:
+        print(f"Detected browsers: {', '.join(b[0] for b in detected_browsers)}")
+    
+    # Try each detected browser
+    for name, browser_type, binary_path in detected_browsers:
+        if browser_type == "chromium":
+            driver = try_chromium_browser(name, binary_path, exceptions)
+        else:  # firefox
+            driver = try_firefox_browser(name, binary_path, exceptions)
+        
+        if driver:
+            print(f"Using {name} browser")
+            return driver
+    
+    # No detected browsers worked, try generic fallback (driver in PATH)
+    print("No browsers detected, trying generic fallback...")
+    
+    driver = try_chromium_browser("Chrome (generic)", None, exceptions)
+    if driver:
+        return driver
+    
+    driver = try_firefox_browser("Firefox (generic)", None, exceptions)
+    if driver:
+        return driver
+    
+    # Nothing worked, show helpful error
+    cls()
+    print("=" * 60)
+    print("BROWSER NOT FOUND")
+    print("=" * 60)
+    print()
+    print("This script needs a browser to work. Supported browsers:")
+    print()
+    print("  Chromium-based (any of these):")
+    print("    - Google Chrome")
+    print("    - Brave")
+    print("    - Microsoft Edge")
+    print("    - Chromium")
+    print("    - Opera")
+    print("    - Vivaldi")
+    print("    - Arc")
+    print()
+    print("  Or Firefox")
+    print()
+    print("Custom browser path:")
+    print("  Set BROWSER_PATH environment variable to your browser executable")
+    print("  Set BROWSER_TYPE to 'chromium' or 'firefox' (default: chromium)")
+    print()
+    print("  Example:")
+    print("    export BROWSER_PATH='/path/to/my/browser'")
+    print("    export BROWSER_TYPE='chromium'")
+    print()
+    if exceptions:
+        print("Debug info:")
+        for browser, exception in exceptions:
+            error_msg = str(exception) if not hasattr(exception, 'msg') else exception.msg
+            print(f"  {browser} {error_msg[:100]}")
+    
     time.sleep(30)
     sys.exit()
 
@@ -561,9 +756,28 @@ def prompt_yes_no(question):
 def get_owned_apps(steam_session):
     owned_content = steam_session.get(STEAM_USERDATA_API).json()
     owned_app_ids = owned_content["rgOwnedPackages"] + owned_content["rgOwnedApps"]
+    
+    # Fetch Steam app list with retry logic
+    app_list = None
+    for attempt in range(3):
+        try:
+            response = steam_session.get(STEAM_APP_LIST_API, timeout=30)
+            if response.status_code == 200 and response.text:
+                app_list = response.json()["applist"]["apps"]
+                break
+            else:
+                print(f"Steam API returned status {response.status_code}, retrying... ({attempt + 1}/3)")
+        except Exception as e:
+            print(f"Error fetching Steam app list: {e}, retrying... ({attempt + 1}/3)")
+        time.sleep(2)
+    
+    if app_list is None:
+        print("Warning: Could not fetch Steam app list. Ownership detection may be less accurate.")
+        app_list = []
+    
     owned_app_details = {
         app["appid"]: app["name"]
-        for app in steam_session.get(STEAM_APP_LIST_API).json()["applist"]["apps"]
+        for app in app_list
         if app["appid"] in owned_app_ids
     }
     return owned_app_details
