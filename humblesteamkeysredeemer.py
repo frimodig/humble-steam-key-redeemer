@@ -1109,7 +1109,96 @@ def prompt_filter_live():
             print("Enter y or n")
     return mode
 
-def redeem_steam_keys(humble_session, humble_keys):
+def retry_errored_keys(humble_session, steam_session, order_details):
+    """Retry keys that previously errored."""
+    errored_file = "errored.csv"
+    if not os.path.exists(errored_file):
+        return
+    
+    # Read errored keys
+    errored_keys = []
+    try:
+        with open(errored_file, "r", encoding="utf-8-sig") as f:
+            lines = f.readlines()
+            for line in lines[1:]:  # Skip header
+                parts = line.strip().split(",")
+                if len(parts) >= 3:
+                    gamekey, human_name, redeemed_key_val = parts[0], parts[1], parts[2]
+                    errored_keys.append({
+                        "gamekey": gamekey,
+                        "human_name": human_name,
+                        "redeemed_key_val": redeemed_key_val
+                    })
+    except Exception as e:
+        print(f"Error reading {errored_file}: {e}")
+        return
+    
+    if not errored_keys:
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"Retrying {len(errored_keys)} previously errored keys...")
+    print(f"{'='*60}\n")
+    
+    # Match errored keys back to order_details
+    all_steam_keys = list(find_dict_keys(order_details, "steam_app_id", True))
+    keys_to_retry = []
+    
+    for errored in errored_keys:
+        # Try to find matching key in order_details
+        for key in all_steam_keys:
+            if (key.get("gamekey") == errored["gamekey"] or 
+                key.get("redeemed_key_val") == errored["redeemed_key_val"]):
+                # Update with the redeemed_key_val from errored.csv
+                key["redeemed_key_val"] = errored["redeemed_key_val"]
+                keys_to_retry.append(key)
+                break
+    
+    if not keys_to_retry:
+        print("No matching keys found in order details to retry.")
+        return
+    
+    print(f"Found {len(keys_to_retry)} keys to retry out of {len(errored_keys)} errored.\n")
+    
+    # Retry the keys
+    total_retry = len(keys_to_retry)
+    for idx, key in enumerate(keys_to_retry, 1):
+        remaining = total_retry - idx + 1
+        print(f"[RETRY {idx}/{total_retry}] {key['human_name']} ({remaining} remaining)")
+        
+        if not valid_steam_key(key["redeemed_key_val"]):
+            print(f"  -> Invalid key format, skipping")
+            continue
+        
+        code = _redeem_steam(steam_session, key["redeemed_key_val"])
+        retry_interval = 300  # 5 minutes between retries
+        seconds_waited = 0
+        while code == 53:
+            minutes_waited = seconds_waited // 60
+            next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
+            print(
+                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
+                end="\r",
+            )
+            time.sleep(10)
+            seconds_waited += 10
+            if seconds_waited % retry_interval == 0:
+                print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
+                code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
+                if code == 53:
+                    print("Still rate limited.")
+        
+        if code == 53:
+            print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
+        
+        write_key(code, key)
+    
+    print(f"\n{'='*60}")
+    print(f"Completed retry pass: {total_retry} keys processed")
+    print(f"{'='*60}\n")
+
+
+def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     session = steam_login()
 
     print("Successfully signed in on Steam.")
@@ -1147,10 +1236,16 @@ def redeem_steam_keys(humble_session, humble_keys):
         # Preserve original order
         unownedgames = sorted(unownedgames,key=lambda g: humble_keys.index(g))
     
+    total_to_redeem = len(unownedgames)
+    print(f"\n{'='*60}")
+    print(f"Starting redemption: {total_to_redeem} keys to process")
+    print(f"{'='*60}\n")
+    
     redeemed = []
 
-    for key in unownedgames:
-        print(key["human_name"])
+    for idx, key in enumerate(unownedgames, 1):
+        remaining = total_to_redeem - idx + 1
+        print(f"[{idx}/{total_to_redeem}] {key['human_name']} ({remaining} remaining)")
 
         if key["human_name"] in redeemed or (key["steam_app_id"] != None and key["steam_app_id"] in redeemed):
             # We've bumped into a repeat of the same game!
@@ -1191,19 +1286,30 @@ def redeem_steam_keys(humble_session, humble_keys):
             minutes_waited = seconds_waited // 60
             next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
             print(
-                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr)   ",
+                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
                 end="\r",
             )
             time.sleep(10)
             seconds_waited += 10
             if seconds_waited % retry_interval == 0:
                 # Try again every 5 minutes
-                print(f"\nRetrying after {seconds_waited // 60} minutes...")
+                print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
                 if code == 53:
                     print("Still rate limited.")
+        
+        if code == 53:
+            # Rate limit cleared, show remaining count
+            print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
 
         write_key(code, key)
+    
+    print(f"\n{'='*60}")
+    print(f"Completed initial pass: {total_to_redeem} keys processed")
+    print(f"{'='*60}\n")
+    
+    # Return session for retrying errored keys
+    return session
 
 
 def export_mode(humble_session,order_details):
@@ -1410,7 +1516,8 @@ def humble_chooser_mode(humble_session,order_details):
             print("Redeeming keys now!")
             updated_monthlies = humble_session.execute_async_script(getHumbleOrders.replace('%optional%',json.dumps(try_redeem_keys)))
             chosen_keys = list(find_dict_keys(updated_monthlies,"steam_app_id",True))
-            redeem_steam_keys(humble_session,chosen_keys)
+            steam_session = redeem_steam_keys(humble_session, chosen_keys, updated_monthlies)
+            retry_errored_keys(humble_session, steam_session, updated_monthlies)
 
 def cls():
     # Don't clear screen in auto mode - we want to preserve the log
@@ -1475,8 +1582,11 @@ if __name__=="__main__":
         except FileNotFoundError:
             pass
     filtered_count = original_length - len(steam_keys)
+    unredeemed_count = len(steam_keys)
     if filtered_count > 0:
-        print(f"Found {total_steam_keys} Steam keys, {filtered_count} already processed, {len(steam_keys)} remaining")
+        print(f"Found {total_steam_keys} Steam keys, {filtered_count} already processed, {unredeemed_count} unredeemed")
+    else:
+        print(f"Found {total_steam_keys} Steam keys, {unredeemed_count} unredeemed")
 
     for key in steam_keys:
         if "redeemed_key_val" in key:
@@ -1494,10 +1604,13 @@ if __name__=="__main__":
     if will_reveal_keys:
         try_already_revealed = prompt_yes_no("Would you like to attempt redeeming already-revealed keys as well?")
         # User has chosen to either redeem all keys or just the 'unrevealed' ones.
-        redeem_steam_keys(driver, steam_keys if try_already_revealed else unrevealed_keys)
+        steam_session = redeem_steam_keys(driver, steam_keys if try_already_revealed else unrevealed_keys, order_details)
     else:
         # User has excluded unrevealed keys.
-        redeem_steam_keys(driver, revealed_keys)
+        steam_session = redeem_steam_keys(driver, revealed_keys, order_details)
+    
+    # Retry errored keys after main redemption
+    retry_errored_keys(driver, steam_session, order_details)
 
     # Cleanup
     for f in files:
