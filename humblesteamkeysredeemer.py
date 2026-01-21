@@ -2,7 +2,13 @@ import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import (
+    WebDriverException, 
+    TimeoutException,
+    InvalidSessionIdException,
+    NoSuchWindowException,
+    StaleElementReferenceException
+)
 from fuzzywuzzy import fuzz
 import steam.webauth as wa
 import time
@@ -13,15 +19,34 @@ import json
 import sys
 import webbrowser
 from base64 import b64encode
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import atexit
 import signal
 from http.client import responses
 import argparse
 import csv
+import threading
+import functools
+from datetime import datetime, timedelta
+import logging
+from logging.handlers import RotatingFileHandler
+from contextlib import contextmanager
+from pathlib import Path
+import hashlib
+
+# Try to import encryption support
+try:
+    from cryptography.fernet import Fernet
+    HAS_ENCRYPTION = True
+except ImportError:
+    HAS_ENCRYPTION = False
 
 # Auto mode flag - when True, auto-answers prompts for daemon/unattended operation
 AUTO_MODE = False
+
+# Cache directory for storing fetched data
+CACHE_DIR = Path(".cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 try:
     from webdriver_manager.chrome import ChromeDriverManager
@@ -34,8 +59,80 @@ except ImportError:
 #patch steam webauth for password feedback
 wa.getpass = pwinput
 
+# Setup proper logging with rotation
+def setup_logging():
+    """Setup rotating log handler to prevent unbounded log growth."""
+    # Create logger
+    logger = logging.getLogger('humble_redeemer')
+    logger.setLevel(logging.DEBUG)  # Capture all levels
+    
+    # File handler for errors and warnings (rotating)
+    file_handler = RotatingFileHandler('error.log', maxBytes=10*1024*1024, backupCount=3)
+    file_handler.setLevel(logging.WARNING)  # Only warnings and errors to file
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler for errors only (to original stderr)
+    console_handler = logging.StreamHandler(sys.__stderr__)
+    console_handler.setLevel(logging.ERROR)  # Only errors to console
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+    
+    # Redirect stderr to logger with smart level detection
+    class LoggerWriter:
+        def __init__(self, logger):
+            self.logger = logger
+            self.buffer = []
+        
+        def write(self, message):
+            # Buffer messages to handle multi-line output
+            if message and message != '\n':
+                self.buffer.append(message)
+                if message.endswith('\n') or '\n' in message:
+                    full_message = ''.join(self.buffer).strip()
+                    self.buffer = []
+                    if full_message:
+                        self._log_with_level(full_message)
+        
+        def _log_with_level(self, message):
+            """Detect log level from message content."""
+            msg_lower = message.lower()
+            if any(x in msg_lower for x in ['error', 'exception', 'failed', 'fail', 'traceback']):
+                self.logger.error(message)
+            elif any(x in msg_lower for x in ['warning', 'warn']):
+                self.logger.warning(message)
+            elif any(x in msg_lower for x in ['debug', '[debug]']):
+                self.logger.debug(message)
+            else:
+                # Default to warning for stderr (since it's usually important)
+                self.logger.warning(message)
+        
+        def flush(self):
+            if self.buffer:
+                full_message = ''.join(self.buffer).strip()
+                if full_message:
+                    self._log_with_level(full_message)
+                self.buffer = []
+    
+    sys.stderr = LoggerWriter(logger)
+
 if __name__ == "__main__":
-    sys.stderr = open('error.log','a')
+    # Check Python version
+    MIN_PYTHON = (3, 7)
+    if sys.version_info < MIN_PYTHON:
+        print(f"Error: This script requires Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or higher.")
+        print(f"You are running Python {sys.version_info.major}.{sys.version_info.minor}.")
+        sys.exit(1)
+    
+    setup_logging()
+    
+    # Inform about encryption availability (only once at startup, not in auto-mode)
+    if not HAS_ENCRYPTION and not AUTO_MODE:
+        print("[INFO] cryptography package not found. Cookies will be stored unencrypted.")
+        print("      Install with: pip install cryptography")
+        print("      Using restrictive file permissions (600) as fallback.")
 
 # Humble endpoints
 HUMBLE_LOGIN_PAGE = "https://www.humblebundle.com/login"
@@ -63,8 +160,62 @@ headers = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
 
+# Script execution timeout (seconds)
+SCRIPT_TIMEOUT = 40  # Reduced to give 10s buffer after JS timeout (30s)
+
+
+def retry_on_session_error(max_retries=3, delay=2):
+    """Decorator to retry operations on session errors."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (InvalidSessionIdException, NoSuchWindowException) as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    print(f"[DEBUG] Session error in {func.__name__}, attempt {attempt + 1}/{max_retries}: {e}")
+                    time.sleep(delay)
+                except TimeoutException as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    print(f"[DEBUG] Timeout in {func.__name__}, attempt {attempt + 1}/{max_retries}")
+                    time.sleep(delay)
+            return None
+        return wrapper
+    return decorator
+
+
+def validate_session(driver):
+    """Check if the WebDriver session is still valid."""
+    try:
+        # Simple check - get current URL
+        _ = driver.current_url
+        return True
+    except (InvalidSessionIdException, NoSuchWindowException):
+        return False
+    except Exception as e:
+        print(f"[DEBUG] Unexpected error validating session: {e}")
+        return False
+
+
+def refresh_page_if_needed(driver, url=None):
+    """Refresh the page if session seems stale."""
+    try:
+        if url:
+            driver.get(url)
+        else:
+            driver.refresh()
+        time.sleep(2)
+        return True
+    except Exception as e:
+        print(f"[DEBUG] Failed to refresh page: {e}")
+        return False
+
 
 def find_dict_keys(node, kv, parent=False):
+    """Recursively find all values (or parent dicts) with a given key."""
     if isinstance(node, list):
         for i in node:
             for x in find_dict_keys(i, kv, parent):
@@ -81,12 +232,34 @@ def find_dict_keys(node, kv, parent=False):
 
 getHumbleOrders = '''
 var done = arguments[arguments.length - 1];
+console.log('[DEBUG] Starting getHumbleOrderDetails');
 var list = '%optional%';
 if (list){
     list = JSON.parse(list);
 } else {
     list = [];
 }
+
+// Prevent duplicate callbacks with a flag
+var callbackFired = false;
+var timeoutId = null;
+
+function safeCallback(result) {
+    if (!callbackFired) {
+        callbackFired = true;
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+        }
+        done(result);
+    }
+}
+
+// Add timeout wrapper to ensure callback is always called
+timeoutId = setTimeout(function() {
+    console.error('[DEBUG] Timeout: Fetching order details took too long');
+    safeCallback({error: 'timeout', message: 'Request timed out after 30 seconds'});
+}, 30000);  // Reduced from 50s to 30s
+
 var getHumbleOrderDetails = async (list) => {
   const HUMBLE_ORDERS_API_URL = 'https://www.humblebundle.com/api/v1/user/order';
   const HUMBLE_ORDER_DETAILS_API = 'https://www.humblebundle.com/api/v1/order/';
@@ -96,25 +269,128 @@ var getHumbleOrderDetails = async (list) => {
     if(list.length){
       orders = list.map(item => ({ gamekey: item }));
     } else {
-      const response = await fetch(HUMBLE_ORDERS_API_URL);
-      orders = await response.json();
+      try {
+        console.log('[DEBUG] Fetching orders list from:', HUMBLE_ORDERS_API_URL);
+        // Add timeout using AbortController for better compatibility
+        var controller = new AbortController();
+        var fetchTimeout = setTimeout(() => controller.abort(), 25000);  // Reduced from 45s to 25s
+        const response = await fetch(HUMBLE_ORDERS_API_URL, {
+          signal: controller.signal,
+          credentials: 'include'  // Include cookies for authentication
+        });
+        clearTimeout(fetchTimeout);
+        console.log('[DEBUG] Orders list response status:', response.status);
+        // Check for authentication errors
+        if (response.status === 401 || response.status === 403) {
+          return {error: 'auth_error', message: 'Authentication failed (HTTP ' + response.status + ') - session may have expired'};
+        }
+        if (!response.ok) {
+          return {error: 'http_error', message: 'HTTP error ' + response.status + ' when fetching orders'};
+        }
+        
+        // Try to parse JSON with better error handling
+        try {
+          orders = await response.json();
+        } catch (jsonError) {
+          console.error('[DEBUG] JSON parse error for orders list:', jsonError);
+          const textPreview = await response.text().catch(() => 'Could not read response body');
+          return {
+            error: 'json_parse_error', 
+            message: 'Humble Bundle returned invalid JSON: ' + jsonError.message,
+            details: 'Response preview (first 500 chars): ' + textPreview.substring(0, 500)
+          };
+        }
+      } catch (fetchError) {
+        if (fetchError.name === 'AbortError' || fetchError.name === 'TimeoutError') {
+          return {error: 'timeout', message: 'Request timed out while fetching orders list'};
+        }
+        return {error: 'network_error', message: 'Network error fetching orders: ' + fetchError.message + ' (This may indicate Cloudflare blocking or network issues)'};
+      }
     }
     const orderDetailsPromises = orders.map(async (order) => {
-      const orderDetailsUrl = `${HUMBLE_ORDER_DETAILS_API}${order['gamekey']}?all_tpkds=true`;
-      const orderDetailsResponse = await fetch(orderDetailsUrl);
-      const orderDetails = await orderDetailsResponse.json();
-      return orderDetails;
+      try {
+        var controller = new AbortController();
+        var fetchTimeout = setTimeout(() => controller.abort(), 25000);  // Reduced from 45s to 25s
+        const orderDetailsUrl = `${HUMBLE_ORDER_DETAILS_API}${order['gamekey']}?all_tpkds=true`;
+        const orderDetailsResponse = await fetch(orderDetailsUrl, {
+          signal: controller.signal,
+          credentials: 'include'  // Include cookies for authentication
+        });
+        clearTimeout(fetchTimeout);
+        // Check for authentication errors
+        if (orderDetailsResponse.status === 401 || orderDetailsResponse.status === 403) {
+          return {error: 'auth_error', message: 'Authentication failed (HTTP ' + orderDetailsResponse.status + ') - session may have expired'};
+        }
+        if (!orderDetailsResponse.ok) {
+          return {error: 'http_error', message: 'HTTP error ' + orderDetailsResponse.status + ' when fetching order details'};
+        }
+        
+        // Try to parse JSON with better error handling
+        try {
+          const orderDetails = await orderDetailsResponse.json();
+          return orderDetails;
+        } catch (jsonError) {
+          console.error('[DEBUG] JSON parse error for order', order['gamekey'], ':', jsonError);
+          // Try to get response text for debugging
+          const textPreview = await orderDetailsResponse.text().catch(() => 'Could not read response body');
+          return {
+            error: 'json_parse_error',
+            message: 'Invalid JSON for order ' + order['gamekey'] + ': ' + jsonError.message,
+            details: 'Response preview: ' + textPreview.substring(0, 200),
+            gamekey: order['gamekey']
+          };
+        }
+      } catch (fetchError) {
+        if (fetchError.name === 'AbortError' || fetchError.name === 'TimeoutError') {
+          return {error: 'timeout', message: 'Request timed out while fetching order details for ' + order['gamekey']};
+        }
+        return {error: 'network_error', message: 'Network error fetching order details: ' + fetchError.message};
+      }
     });
 
     const orderDetailsArray = await Promise.all(orderDetailsPromises);
-    return orderDetailsArray;
+    
+    // Separate successful orders from errors
+    const successfulOrders = [];
+    const failedOrders = [];
+    
+    for (var i = 0; i < orderDetailsArray.length; i++) {
+      const order = orderDetailsArray[i];
+      if (order && typeof order === 'object' && 'error' in order) {
+        failedOrders.push(order);
+        console.warn('[WARNING] Failed to fetch order:', order.gamekey || 'unknown', '-', order.message);
+      } else {
+        successfulOrders.push(order);
+      }
+    }
+    
+    // Only fail if ALL orders failed or if the main order list failed
+    if (successfulOrders.length === 0) {
+      console.error('[ERROR] All orders failed to fetch');
+      return failedOrders[0] || {error: 'fetch_error', message: 'All orders failed to fetch'};
+    }
+    
+    // Log summary if some orders failed
+    if (failedOrders.length > 0) {
+      console.warn('[WARNING] Successfully fetched', successfulOrders.length, 'orders,', failedOrders.length, 'failed');
+      console.warn('[WARNING] Failed order IDs:', failedOrders.map(f => f.gamekey || 'unknown').join(', '));
+    }
+    
+    return successfulOrders;
   } catch (error) {
     console.error('Error:', error);
-    return [];
+    if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+      return {error: 'timeout', message: 'Request timed out'};
+    }
+    return {error: 'fetch_error', message: error.message};
   }
 };
 
-getHumbleOrderDetails(list).then(r => {done(r)});
+getHumbleOrderDetails(list).then(r => {
+    safeCallback(r);
+}).catch(err => {
+    safeCallback({error: 'exception', message: err.message});
+});
 '''
 
 fetch_cmd = '''
@@ -135,32 +411,144 @@ fetch("{url}", {{
 }}).then(r => {{ r.json().then( v=>{{done([r.status,v])}} ) }} );
 '''
 
-def perform_post(driver,url,payload):
-    json_payload = b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
-    csrf = driver.get_cookie('csrf_cookie')
-    csrf = csrf['value'] if csrf is not None else ''
-    if csrf is None:
-        csrf = ''
-
-    return driver.execute_async_script(fetch_cmd.format(formData=json_payload,url=url,csrf=csrf))
-
-def process_quit(driver):
-    def quit_on_exit(*args):
+def perform_post(driver, url, payload, max_retries=3):
+    """
+    Perform a POST request via JavaScript fetch in the browser.
+    Uses exponential backoff and session refresh on retries.
+    """
+    base_delay = 2
+    
+    for attempt in range(max_retries):
         try:
-            driver.quit()
+            # Refresh session if needed before each attempt
+            if not validate_session(driver):
+                if attempt < max_retries - 1:
+                    print(f"[DEBUG] Session invalid, refreshing... (attempt {attempt + 1}/{max_retries})")
+                    refresh_page_if_needed(driver, "https://www.humblebundle.com/home/library")
+                    time.sleep(2)
+                else:
+                    raise InvalidSessionIdException("WebDriver session is invalid after retries")
+            
+            json_payload = b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
+            csrf = driver.get_cookie('csrf_cookie')
+            csrf = csrf['value'] if csrf is not None else ''
+
+            result = driver.execute_async_script(
+                fetch_cmd.format(formData=json_payload, url=url, csrf=csrf)
+            )
+            return result
+            
+        except TimeoutException as e:
+            if attempt == max_retries - 1:
+                print(f"[DEBUG] Timeout executing POST to {url} after {max_retries} attempts")
+                raise
+            # Exponential backoff
+            delay = base_delay * (2 ** attempt)
+            print(f"[DEBUG] Timeout executing POST to {url}, retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
+            
+        except (InvalidSessionIdException, NoSuchWindowException) as e:
+            # Don't retry on session death - it's a permanent error
+            print(f"[DEBUG] Invalid session while executing POST to {url}: {e}")
+            raise
+            
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"[DEBUG] Unexpected error executing POST to {url}: {e}")
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(f"[DEBUG] Error executing POST to {url}, retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
+
+
+def try_firefox_browser(name, binary_path, exceptions, headless=True):
+    """Try to create a Firefox browser driver."""
+    driver = None
+    if HAS_WEBDRIVER_MANAGER:
+        try:
+            options = webdriver.FirefoxOptions()
+            if headless:
+                options.add_argument("-headless")
+            if binary_path:
+                options.binary_location = binary_path
+            service = FirefoxService(GeckoDriverManager().install())
+            driver = webdriver.Firefox(service=service, options=options)
+            driver.set_script_timeout(SCRIPT_TIMEOUT)  # Set timeout immediately
+            driver.set_page_load_timeout(30)
+            process_quit(driver)
+            return driver
+        except Exception as e:
+            exceptions.append((f'{name} (webdriver-manager):', str(e)[:200]))
+    # Fallback without webdriver-manager
+    try:
+        options = webdriver.FirefoxOptions()
+        if headless:
+            options.add_argument("-headless")
+        if binary_path:
+            options.binary_location = binary_path
+        driver = webdriver.Firefox(options=options)
+        driver.set_script_timeout(SCRIPT_TIMEOUT)  # Set timeout immediately
+        driver.set_page_load_timeout(30)
+        process_quit(driver)
+        return driver
+    except Exception as e:
+        exceptions.append((f'{name} (fallback):', str(e)[:200]))
+    return None
+
+
+# Global driver reference for signal handling
+_global_driver = None
+_global_interrupt_event = None
+
+def process_quit(driver, interrupt_event=None):
+    """Register cleanup handlers to quit the driver on exit."""
+    global _global_driver, _global_interrupt_event
+    _global_driver = driver
+    if interrupt_event:
+        _global_interrupt_event = interrupt_event
+    
+    def quit_on_exit(signum, frame):
+        print("\n\nInterrupted by user (Ctrl+C). Cleaning up...", file=sys.stderr, flush=True)
+        # Set interrupt event if available (allows thread to exit gracefully)
+        if _global_interrupt_event:
+            _global_interrupt_event.set()
+        
+        # Try to quit driver gracefully
+        driver_pid = None
+        try:
+            if _global_driver:
+                try:
+                    driver_pid = _global_driver.service.process.pid if hasattr(_global_driver, 'service') and hasattr(_global_driver.service, 'process') else None
+                except:
+                    pass
+                _global_driver.quit()
         except:
             pass
-        sys.exit(0)
+        
+        # Force kill browser process if driver.quit() didn't work
+        if driver_pid:
+            try:
+                os.kill(driver_pid, signal.SIGTERM)
+                time.sleep(0.5)
+                os.kill(driver_pid, signal.SIGKILL)
+            except:
+                pass
+        
+        # Exit with code 130 for SIGINT (Ctrl+C), 143 for SIGTERM
+        exit_code = 130 if signum == signal.SIGINT else 143
+        os._exit(exit_code)  # Use os._exit to force immediate exit
     
     def quit_on_exit_atexit():
         try:
-            driver.quit()
+            if _global_driver:
+                _global_driver.quit()
         except:
             pass
 
     atexit.register(quit_on_exit_atexit)
     signal.signal(signal.SIGTERM, quit_on_exit)
     signal.signal(signal.SIGINT, quit_on_exit)
+
 
 # Browser detection configuration
 # Each entry: (name, type, paths) where type is 'chromium' or 'firefox'
@@ -204,7 +592,7 @@ KNOWN_BROWSERS = [
         "C:/Program Files/Vivaldi/Application/vivaldi.exe",  # Windows
     ]),
     ("Arc", "chromium", [
-        "/Applications/Arc.app/Contents/MacOS/Arc",  # macOS (Arc is macOS only currently)
+        "/Applications/Arc.app/Contents/MacOS/Arc",  # macOS
     ]),
     ("Firefox", "firefox", [
         "/Applications/Firefox.app/Contents/MacOS/firefox",  # macOS
@@ -223,7 +611,6 @@ def detect_browsers():
     # Check for custom browser path via environment variable
     custom_path = os.environ.get("BROWSER_PATH")
     if custom_path and os.path.exists(custom_path):
-        # Assume chromium-based for custom paths (most common)
         browser_type = os.environ.get("BROWSER_TYPE", "chromium")
         detected.append(("Custom", browser_type, custom_path))
     
@@ -232,7 +619,7 @@ def detect_browsers():
         for path in paths:
             if os.path.exists(path):
                 detected.append((name, browser_type, path))
-                break  # Found this browser, move to next
+                break
     
     return detected
 
@@ -247,6 +634,12 @@ def try_chromium_browser(name, binary_path, exceptions, headless=True):
             if headless:
                 options.add_argument("--headless=new")
             options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--no-sandbox")
+            
+            # Enable logging for debugging
+            options.set_capability('goog:loggingPrefs', {'browser': 'ALL', 'performance': 'ALL'})
+            
             if binary_path:
                 options.binary_location = binary_path
             
@@ -260,10 +653,12 @@ def try_chromium_browser(name, binary_path, exceptions, headless=True):
             
             service = ChromeService(ChromeDriverManager(chrome_type=chrome_type).install())
             driver = webdriver.Chrome(service=service, options=options)
+            driver.set_script_timeout(SCRIPT_TIMEOUT)
+            driver.set_page_load_timeout(30)
             process_quit(driver)
             return driver
         except Exception as e:
-            exceptions.append((f'{name} (webdriver-manager):', e))
+            exceptions.append((f'{name} (webdriver-manager):', str(e)[:200]))
     
     # Fallback without webdriver-manager
     try:
@@ -271,47 +666,21 @@ def try_chromium_browser(name, binary_path, exceptions, headless=True):
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+        
+        # Enable logging
+        options.set_capability('goog:loggingPrefs', {'browser': 'ALL'})
+        
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Chrome(options=options)
+        driver.set_script_timeout(SCRIPT_TIMEOUT)
+        driver.set_page_load_timeout(30)
         process_quit(driver)
         return driver
     except Exception as e:
-        exceptions.append((f'{name} (fallback):', e))
-    
-    return None
-
-
-def try_firefox_browser(name, binary_path, exceptions, headless=True):
-    """Try to create a Firefox browser driver."""
-    driver = None
-    
-    if HAS_WEBDRIVER_MANAGER:
-        try:
-            options = webdriver.FirefoxOptions()
-            if headless:
-                options.add_argument("-headless")
-            if binary_path:
-                options.binary_location = binary_path
-            service = FirefoxService(GeckoDriverManager().install())
-            driver = webdriver.Firefox(service=service, options=options)
-            process_quit(driver)
-            return driver
-        except Exception as e:
-            exceptions.append((f'{name} (webdriver-manager):', e))
-    
-    # Fallback without webdriver-manager
-    try:
-        options = webdriver.FirefoxOptions()
-        if headless:
-            options.add_argument("-headless")
-        if binary_path:
-            options.binary_location = binary_path
-        driver = webdriver.Firefox(options=options)
-        process_quit(driver)
-        return driver
-    except Exception as e:
-        exceptions.append((f'{name} (fallback):', e))
+        exceptions.append((f'{name} (fallback):', str(e)[:200]))
     
     return None
 
@@ -319,36 +688,28 @@ def try_firefox_browser(name, binary_path, exceptions, headless=True):
 def get_browser_driver(headless=True):
     """Get a browser driver, auto-detecting available browsers."""
     exceptions = []
-    
     # Detect installed browsers
     detected_browsers = detect_browsers()
-    
     if detected_browsers:
         print(f"Detected browsers: {', '.join(b[0] for b in detected_browsers)}")
-    
     # Try each detected browser
     for name, browser_type, binary_path in detected_browsers:
         if browser_type == "chromium":
             driver = try_chromium_browser(name, binary_path, exceptions, headless)
         else:  # firefox
             driver = try_firefox_browser(name, binary_path, exceptions, headless)
-        
         if driver:
             mode = "headless" if headless else "visible"
             print(f"Using {name} browser ({mode})")
             return driver
-    
     # No detected browsers worked, try generic fallback (driver in PATH)
     print("No browsers detected, trying generic fallback...")
-    
     driver = try_chromium_browser("Chrome (generic)", None, exceptions, headless)
     if driver:
         return driver
-    
     driver = try_firefox_browser("Firefox (generic)", None, exceptions, headless)
     if driver:
         return driver
-    
     # Nothing worked, show helpful error
     cls()
     print("=" * 60)
@@ -379,11 +740,10 @@ def get_browser_driver(headless=True):
     if exceptions:
         print("Debug info:")
         for browser, exception in exceptions:
-            error_msg = str(exception) if not hasattr(exception, 'msg') else exception.msg
-            print(f"  {browser} {error_msg[:100]}")
+            print(f"  {browser} {exception}")
 
     time.sleep(30)
-    sys.exit()
+    sys.exit(1)
 
 MODE_PROMPT = """Welcome to the Humble Exporter!
 Which key export mode would you like to use?
@@ -392,13 +752,14 @@ Which key export mode would you like to use?
 [2] Export keys
 [3] Humble Choice chooser
 """
+
 def prompt_mode(order_details,humble_session):
+    """Prompt user for operation mode."""
     global AUTO_MODE
     if AUTO_MODE:
         print(MODE_PROMPT)
         print("Choose 1, 2, or 3: 1 (auto-mode)")
         return "1"
-    
     mode = None
     while mode not in ["1","2","3"]:
         print(MODE_PROMPT)
@@ -410,6 +771,7 @@ def prompt_mode(order_details,humble_session):
 
 
 def valid_steam_key(key):
+    """Validate Steam key format (XXXXX-XXXXX-XXXXX)."""
     # Steam keys are in the format of AAAAA-BBBBB-CCCCC
     if not isinstance(key, str):
         return False
@@ -421,22 +783,190 @@ def valid_steam_key(key):
     )
 
 
+class SecureCookieManager:
+    """
+    Manages encrypted cookie storage with backward compatibility.
+    
+    Features:
+    - Encrypts cookies using Fernet (AES-128)
+    - Backward compatible with existing unencrypted cookies
+    - Automatic migration from unencrypted to encrypted
+    - Persistent key storage (for auto-mode)
+    """
+    
+    def __init__(self):
+        self.key_file = Path(".cookie_encryption_key")
+        self.cipher = None
+        self.encryption_enabled = HAS_ENCRYPTION
+        
+        if not HAS_ENCRYPTION:
+            # Silent fallback - don't spam console in auto-mode
+            return
+        
+        # Try to load existing key
+        if self.key_file.exists():
+            try:
+                with self.key_file.open("rb") as f:
+                    key = f.read()
+                self.cipher = Fernet(key)
+            except Exception as e:
+                print(f"[WARNING] Could not load encryption key: {e}")
+                print("          Generating new key. Old cookies will need to be re-created.")
+                self._generate_key()
+        else:
+            self._generate_key()
+    
+    def _generate_key(self):
+        """Generate and store a new encryption key."""
+        if not HAS_ENCRYPTION:
+            return
+        
+        key = Fernet.generate_key()
+        try:
+            with self.key_file.open("wb") as f:
+                f.write(key)
+            self.key_file.chmod(0o600)
+            self.cipher = Fernet(key)
+        except Exception as e:
+            print(f"[WARNING] Could not save encryption key: {e}")
+            print("          Cookies will be stored unencrypted.")
+            self.encryption_enabled = False
+    
+    def save_cookies(self, cookie_file, cookies):
+        """
+        Save cookies with encryption if available.
+        
+        Args:
+            cookie_file: Path to cookie file (str or Path)
+            cookies: Cookies to save (dict or list)
+        
+        Returns:
+            bool: True if successful
+        """
+        cookie_path = Path(cookie_file) if not isinstance(cookie_file, Path) else cookie_file
+        
+        try:
+            pickled = pickle.dumps(cookies)
+            
+            if self.encryption_enabled and self.cipher:
+                # Encrypt the cookies
+                encrypted = self.cipher.encrypt(pickled)
+                # Add a marker to indicate encrypted format
+                data = b"ENCRYPTED_V1:" + encrypted
+            else:
+                # Fallback to unencrypted (backward compatible)
+                data = pickled
+            
+            with cookie_path.open("wb") as f:
+                f.write(data)
+            
+            # Set restrictive permissions
+            try:
+                cookie_path.chmod(0o600)
+            except (OSError, AttributeError):
+                pass  # chmod not available on Windows
+            
+            return True
+        except Exception as e:
+            print(f"[DEBUG] Failed to save cookies to {cookie_file}: {e}")
+            return False
+    
+    def load_cookies(self, cookie_file):
+        """
+        Load cookies with automatic format detection (encrypted vs unencrypted).
+        
+        Args:
+            cookie_file: Path to cookie file (str or Path)
+        
+        Returns:
+            Cookies object or None if failed
+        """
+        cookie_path = Path(cookie_file) if not isinstance(cookie_file, Path) else cookie_file
+        
+        if not cookie_path.exists():
+            return None
+        
+        try:
+            with cookie_path.open("rb") as f:
+                data = f.read()
+            
+            # Check if data is encrypted (has our marker)
+            if data.startswith(b"ENCRYPTED_V1:"):
+                if not self.encryption_enabled or not self.cipher:
+                    print(f"[ERROR] Cookie file is encrypted but encryption is not available.")
+                    print(f"        Install cryptography: pip install cryptography")
+                    return None
+                
+                # Strip marker and decrypt
+                encrypted_data = data[len(b"ENCRYPTED_V1:"):]
+                try:
+                    pickled = self.cipher.decrypt(encrypted_data)
+                except Exception as e:
+                    print(f"[ERROR] Failed to decrypt cookies: {e}")
+                    print(f"        The encryption key may have changed.")
+                    print(f"        Delete {cookie_file} and log in again.")
+                    return None
+            else:
+                # Legacy unencrypted format
+                pickled = data
+                
+                # Auto-migrate to encrypted format
+                if self.encryption_enabled and self.cipher:
+                    cookies = pickle.loads(pickled)
+                    self.save_cookies(cookie_file, cookies)
+                    return cookies
+            
+            return pickle.loads(pickled)
+        except Exception as e:
+            print(f"[DEBUG] Failed to load cookies from {cookie_file}: {e}")
+            return None
+
+# Global cookie manager instance
+_cookie_manager = None
+
+def get_cookie_manager():
+    """Get or create the global cookie manager instance."""
+    global _cookie_manager
+    if _cookie_manager is None:
+        _cookie_manager = SecureCookieManager()
+    return _cookie_manager
+
+
 def try_recover_cookies(cookie_file, session):
+    """Try to load saved cookies from file using secure storage."""
+    manager = get_cookie_manager()
+    cookies = manager.load_cookies(cookie_file)
+    
+    if not cookies:
+        return False
+    
     try:
-        cookies = pickle.load(open(cookie_file,"rb"))
         if type(session) is requests.Session:
             # handle Steam session
             session.cookies.update(cookies)
         else:
             # handle WebDriver
             for cookie in cookies:
-                session.add_cookie(cookie)
+                try:
+                    session.add_cookie(cookie)
+                except Exception:
+                    # Skip invalid cookies
+                    pass
         return True
     except Exception as e:
+        print(f"[DEBUG] Failed to apply cookies from {cookie_file}: {e}")
         return False
 
 
 def export_cookies(cookie_file, session):
+    """
+    Save cookies to file with encryption.
+    
+    Cookies are encrypted using Fernet (AES-128) if the cryptography package is available.
+    Falls back to unencrypted storage with restrictive permissions (600) if not.
+    
+    Install encryption support with: pip install cryptography
+    """
     try:
         cookies = None
         if type(session) is requests.Session:
@@ -445,9 +975,11 @@ def export_cookies(cookie_file, session):
         else:
             # handle WebDriver
             cookies = session.get_cookies()
-        pickle.dump(cookies, open(cookie_file,"wb"))
-        return True
-    except:
+        
+        manager = get_cookie_manager()
+        return manager.save_cookies(cookie_file, cookies)
+    except Exception as e:
+        print(f"[DEBUG] Failed to export cookies to {cookie_file}: {e}")
         return False
 
 is_logged_in = '''
@@ -457,54 +989,79 @@ fetch("https://www.humblebundle.com/home/library").then(r => {done(!r.redirected
 '''
 
 def verify_logins_session(session):
-    # Returns [humble_status, steam_status]
+    """Verify login status for Humble and/or Steam. Returns [humble_status, steam_status]."""
     if type(session) is requests.Session:
         loggedin = session.get(STEAM_KEYS_PAGE, allow_redirects=False).status_code not in (301,302)
         return [False,loggedin]
     else:
-        return [session.execute_async_script(is_logged_in),False]
+        try:
+            humble_logged_in = session.execute_async_script(is_logged_in)
+            return [humble_logged_in, False]
+        except TimeoutException:
+            print("[DEBUG] Timeout verifying Humble login status")
+            return [False, False]
+        except Exception as e:
+            print(f"[DEBUG] Error verifying login: {e}")
+            return [False, False]
 
 def do_login(driver,payload):
-        auth,login_json = perform_post(driver,HUMBLE_LOGIN_API,payload)
-        if auth not in (200,401):
-            print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses[auth]}).")
-            time.sleep(30)
-            sys.exit()
-        return auth,login_json
+    """Perform login POST request via browser."""
+    auth,login_json = perform_post(driver,HUMBLE_LOGIN_API,payload)
+    if auth not in (200,401):
+        print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses.get(auth, 'Unknown')}).")
+        time.sleep(30)
+        sys.exit(1)
+    return auth,login_json
 
 def humble_login(driver, is_headless=True):
     """Login to Humble. Returns (driver, success) - driver may be different if we switched to visible mode."""
     global AUTO_MODE
     cls()
-    
     # First check if we have saved cookies - go to main site to load them
-    cookie_file = ".humblecookies"
-    if os.path.exists(cookie_file):
-        driver.get("https://www.humblebundle.com/")
-        time.sleep(1)
-        if try_recover_cookies(cookie_file, driver) and verify_logins_session(driver)[0]:
-            print("Using saved Humble session.")
-            return driver, True
-        print("Saved session expired, need to log in again.")
+    cookie_file = Path(".humblecookies")
+    cookies_exist = cookie_file.exists()
     
-    # Go to login page (still headless - try API login first)
-    driver.get(HUMBLE_LOGIN_PAGE)
-    time.sleep(2)  # Let page fully load
-
-    # Saved session doesn't work - need interactive login
+    if cookies_exist:
+        try:
+            driver.get("https://www.humblebundle.com/")
+            time.sleep(2)  # Let cookies load
+            if try_recover_cookies(cookie_file, driver):
+                time.sleep(1)
+                if verify_logins_session(driver)[0]:
+                    print("Using saved Humble session.")
+                    return driver, True
+            print("Saved session expired, need to log in again.")
+        except Exception as e:
+            print(f"[DEBUG] Error loading saved session: {e}")
+    
+    # In AUTO_MODE, we require valid cookies - exit if they don't exist or are invalid
     if AUTO_MODE:
         print("")
         print("="*60)
-        print("HUMBLE SESSION EXPIRED")
+        print("HUMBLE SESSION EXPIRED OR MISSING")
         print("="*60)
-        print("The Humble login cookies are stale or missing.")
+        if not cookies_exist:
+            print("The Humble login cookies file (.humblecookies) is missing.")
+        else:
+            print("The Humble login cookies are stale or invalid.")
         print("")
         print("To fix this, run the script manually to re-login:")
         print("  python3 humblesteamkeysredeemer.py")
         print("")
-        print("Then restart the daemon.")
+        print("This will prompt for your credentials and 2FA code.")
+        print("Once logged in, restart the daemon.")
         print("="*60)
-        sys.exit(2)  # Exit code 2 = stale cookies
+        driver.quit()
+        sys.exit(2)  # Exit code 2 = stale/missing cookies
+
+    # Go to login page (only in non-auto mode - try API login first)
+    try:
+        driver.get(HUMBLE_LOGIN_PAGE)
+        time.sleep(2)  # Let page fully load
+    except Exception as e:
+        print(f"Error loading Humble login page: {e}")
+        driver.quit()
+        sys.exit(1)
 
     # Try automatic API login first (works in headless if Cloudflare allows)
     authorized = False
@@ -523,8 +1080,17 @@ def humble_login(driver, is_headless=True):
 
         try:
             auth, login_json = do_login(driver, payload)
+        except TimeoutException as e:
+            print(f"[DEBUG] Login request timed out: {e}")
+            print("This may be due to Cloudflare blocking. Switching to visible browser for manual login...")
+            # Only switch to visible browser if we're currently headless
+            if is_headless:
+                driver.quit()
+                driver = get_browser_driver(headless=False)
+            return humble_login_manual(driver), True
         except Exception as e:
             print(f"[DEBUG] Auto-login failed: {e}")
+            print(f"[DEBUG] Exception type: {type(e).__name__}")
             # Only switch to visible browser if we're currently headless
             if is_headless:
                 print("Switching to visible browser for manual login...")
@@ -532,11 +1098,23 @@ def humble_login(driver, is_headless=True):
                 driver = get_browser_driver(headless=False)
             return humble_login_manual(driver), True
 
+        # Debug: show what we got back
+        if "two_factor_required" in login_json or "humble_guard_required" in login_json:
+            print(f"[DEBUG] 2FA required. Response keys: {list(login_json.keys())}")
+            if "errors" in login_json:
+                print(f"[DEBUG] Errors in response: {login_json['errors']}")
+
         if "errors" in login_json and "username" in login_json["errors"]:
             # Unknown email OR mismatched password
             print(login_json["errors"]["username"][0])
             continue
 
+        # Check if login succeeded without 2FA
+        if auth == 200 and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
+            authorized = True
+            break
+
+        # Handle 2FA - simplified logic: if either flag is present, prompt for code
         while "humble_guard_required" in login_json or "two_factor_required" in login_json:
             # There may be differences for Humble's SMS 2FA, haven't tested.
             try:
@@ -544,7 +1122,7 @@ def humble_login(driver, is_headless=True):
                     humble_guard_code = input("Please enter the Humble security code (check email): ")
                     payload["guard"] = humble_guard_code.upper()
                     # Humble security codes are case-sensitive via API, but luckily it's all uppercase!
-                    auth,login_json = do_login(driver,payload)
+                    auth, login_json = do_login(driver, payload)
 
                     if (
                         "user_terms_opt_in_data" in login_json
@@ -554,24 +1132,38 @@ def humble_login(driver, is_headless=True):
                         print(
                             "There's been an update to the TOS, please sign in to Humble on your browser."
                         )
-                        sys.exit()
-                elif (
-                    "two_factor_required" in login_json and
-                    "errors" in login_json
-                    and "authy-input" in login_json["errors"]
-                ):
+                        sys.exit(1)
+                elif "two_factor_required" in login_json:
+                    # Simplified: if two_factor_required is present, prompt for code
+                    # Don't require specific error structure
                     code = input("Please enter 2FA code: ")
                     payload["code"] = code
-                    auth,login_json = do_login(driver,payload)
-                elif "errors" in login_json:
-                    print("Unexpected login error detected.")
-                    print(login_json["errors"])
-                    raise Exception(login_json)
-                
-                if auth == 200:
+                    auth, login_json = do_login(driver, payload)
+                else:
+                    # Shouldn't reach here, but handle gracefully
+                    print(f"[DEBUG] Unexpected 2FA state. login_json keys: {list(login_json.keys())}")
+                    if "errors" in login_json:
+                        print(f"[DEBUG] Errors: {login_json['errors']}")
                     break
+                
+                # Check for success
+                if auth == 200 and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
+                    authorized = True
+                    break
+                    
+            except TimeoutException as e:
+                print(f"[DEBUG] 2FA submission timed out: {e}")
+                # Only switch to visible browser if we're currently headless
+                if is_headless:
+                    print("Switching to visible browser for manual login...")
+                    driver.quit()
+                    driver = get_browser_driver(headless=False)
+                return humble_login_manual(driver), True
             except Exception as e:
                 print(f"[DEBUG] 2FA submission failed: {e}")
+                print(f"[DEBUG] Exception type: {type(e).__name__}")
+                import traceback
+                traceback.print_exc()
                 # Only switch to visible browser if we're currently headless
                 if is_headless:
                     print("Switching to visible browser for manual login...")
@@ -586,7 +1178,6 @@ def humble_login(driver, is_headless=True):
 def humble_login_manual(driver):
     """Manual login fallback when API is blocked by Cloudflare. Returns the driver."""
     global AUTO_MODE
-    
     if AUTO_MODE:
         print("")
         print("="*60)
@@ -600,7 +1191,6 @@ def humble_login_manual(driver):
         print("Then restart the daemon.")
         print("="*60)
         sys.exit(2)  # Exit code 2 = stale cookies
-    
     print("\n" + "="*60)
     print("MANUAL LOGIN REQUIRED")
     print("="*60)
@@ -608,23 +1198,20 @@ def humble_login_manual(driver):
     print("Please log in manually (handle any CAPTCHAs or 2FA).")
     print("Once logged in and you see your library, press Enter here.")
     print("="*60 + "\n")
-    
     driver.get(HUMBLE_LOGIN_PAGE)
     input("Press Enter after you've logged in successfully...")
-    
     # Verify login worked
     driver.get("https://www.humblebundle.com/home/library")
     time.sleep(2)
-    
     if "login" in driver.current_url.lower():
         print("Login verification failed - still on login page. Please try again.")
         return humble_login_manual(driver)  # Retry
-    
     export_cookies(".humblecookies", driver)
     return driver
 
 
 def steam_login():
+    """Login to Steam web. Returns authenticated session."""
     global AUTO_MODE
     # Sign into Steam web
 
@@ -647,38 +1234,123 @@ def steam_login():
         print("Then restart the daemon.")
         print("="*60)
         sys.exit(2)  # Exit code 2 = stale cookies
-    
     # Prompt user to sign in.
     s_username = input("Steam Username: ")
     user = wa.WebAuth(s_username)
-    session = user.cli_login()
-    export_cookies(".steamcookies", session)
-    return session
-
-
-def redeem_humble_key(sess, tpk):
-    # Keys need to be 'redeemed' on Humble first before the Humble API gives the user a Steam key.
-    # This triggers that for a given Humble key entry
-    payload = {"keytype": tpk["machine_name"], "key": tpk["gamekey"], "keyindex": tpk["keyindex"]}
-    status,respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
-    
-    if status != 200 or "error_msg" in respjson or not respjson.get("success", False):
-        print("Error redeeming key on Humble for " + tpk["human_name"])
-        if "error_msg" in respjson:
-            error_msg = respjson["error_msg"]
-            print(error_msg)
-            # Check for expired key
-            if "expired" in error_msg.lower():
-                return "EXPIRED"
-        return ""
     try:
-        return respjson["key"]
-    except:
-        return respjson
+        session = user.cli_login()
+        export_cookies(".steamcookies", session)
+        return session
+    except KeyError as e:
+        if "'client_id'" in str(e) or "client_id" in str(e):
+            print(f"Error logging into Steam: Missing 'client_id' parameter")
+            print("This may be due to a Steam API change or library issue.")
+            print("")
+            print("Possible solutions:")
+            print("1. Update the steam library: pip install --upgrade 'steam @ git+https://github.com/FailSpy/steam-py-lib@master'")
+            print("2. Check if Steam's login API has changed")
+            print("3. Try logging in via browser and copying cookies manually")
+        else:
+            print(f"Error logging into Steam (KeyError): {e}")
+        print("Please try again.")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error logging into Steam: {e}")
+        print(f"Exception type: {type(e).__name__}")
+        print("Please try again.")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
+
+def redeem_humble_key(sess, tpk, max_retries=3):
+    """
+    Redeem a key on Humble Bundle to reveal the actual Steam key.
+    Returns the revealed key, "EXPIRED" for expired keys, or empty string on error.
+    """
+    payload = {
+        "keytype": tpk["machine_name"], 
+        "key": tpk["gamekey"], 
+        "keyindex": tpk.get("keyindex", 0)
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            # Validate session before attempting
+            if not validate_session(sess):
+                print(f"  -> Invalid session detected, attempting to recover...")
+                if not refresh_page_if_needed(sess, "https://www.humblebundle.com/home/library"):
+                    if attempt < max_retries - 1:
+                        print(f"  -> Recovery failed, retrying... (attempt {attempt + 2}/{max_retries})")
+                        time.sleep(2)
+                        continue
+                    print(f"  -> Failed to recover session for {tpk['human_name']}")
+                    return ""
+                time.sleep(2)
+            
+            status, respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
+            
+            if status != 200:
+                print(f"  -> HTTP {status} while redeeming {tpk['human_name']}")
+                if attempt < max_retries - 1:
+                    print(f"  -> Retrying... (attempt {attempt + 2}/{max_retries})")
+                    time.sleep(2)
+                    continue
+                return ""
+            
+            if "error_msg" in respjson or not respjson.get("success", False):
+                error_msg = respjson.get("error_msg", "Unknown error")
+                print(f"  -> Error redeeming key: {error_msg}")
+                
+                # Check for expired key
+                if "expired" in error_msg.lower():
+                    return "EXPIRED"
+                
+                # Don't retry on explicit errors from Humble
+                return ""
+            
+            try:
+                return respjson["key"]
+            except KeyError:
+                print(f"  -> Warning: Unexpected response format for {tpk['human_name']}")
+                return str(respjson)
+                
+        except TimeoutException:
+            print(f"  -> Timeout (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(3)
+                continue
+            return ""
+            
+        except (InvalidSessionIdException, NoSuchWindowException):
+            print(f"  -> Session invalid (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                # Try to recover
+                print(f"  -> Attempting to recover session...")
+                try:
+                    sess.get("https://www.humblebundle.com/home/library")
+                    time.sleep(3)
+                except:
+                    pass
+                continue
+            return ""
+            
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = str(e)[:100]
+            print(f"  -> {error_type}: {error_msg}")
+            if attempt < max_retries - 1:
+                print(f"  -> Retrying... (attempt {attempt + 2}/{max_retries})")
+                time.sleep(2)
+                continue
+            return ""
+    
+    return ""
 
 def get_month_data(humble_session,month):
-    # No real API for this, seems to just be served on the webpage.
+    """Fetch Humble Choice month data. Needs a requests session, not WebDriver."""
     if type(humble_session) is not requests.Session:
         raise Exception("get_month_data needs a configured requests session")
     r = humble_session.get(HUMBLE_SUB_PAGE + month["product"]["choice_url"])
@@ -690,13 +1362,14 @@ def get_month_data(humble_session,month):
 
 
 def get_choices(humble_session,order_details):
+    """Generator that yields months with available choices."""
     months = [
         month for month in order_details 
-        if "choice_url" in month["product"] 
+        if "choice_url" in month.get("product", {})
     ]
 
     # Oldest to Newest order
-    months = sorted(months,key=lambda m: m["created"])
+    months = sorted(months,key=lambda m: m.get("created", 0))
     request_session = requests.Session()
     for cookie in humble_session.get_cookies():
         # convert cookies to requests
@@ -704,8 +1377,8 @@ def get_choices(humble_session,order_details):
 
     choices = []
     for month in months:
-        if month["choices_remaining"] > 0 or month["product"].get("is_subs_v3_product",False): # subs v3 products don't advertise choices, need to get them exhaustively
-            chosen_games = set(find_dict_keys(month["tpkd_dict"],"machine_name"))
+        if month.get("choices_remaining", 0) > 0 or month.get("product", {}).get("is_subs_v3_product",False):
+            chosen_games = set(find_dict_keys(month.get("tpkd_dict", {}),"machine_name"))
 
             month["choice_data"] = get_month_data(request_session,month)
             if not month["choice_data"].get('canRedeemGames',True):
@@ -713,14 +1386,12 @@ def get_choices(humble_session,order_details):
                 continue
 
             v3 = not month["choice_data"].get("usesChoices",True)
-            
             # Needed for choosing
             if v3:
                 identifier = "initial"
                 choice_options = month["choice_data"]["contentChoiceData"]["game_data"]
             else:
                 identifier = "initial" if "initial" in month["choice_data"]["contentChoiceData"] else "initial-classic"
-            
                 if identifier not in month["choice_data"]["contentChoiceData"]:
                     for key in month["choice_data"]["contentChoiceData"].keys():
                         if "content_choices" in month["choice_data"]["contentChoiceData"][key]:
@@ -734,14 +1405,16 @@ def get_choices(humble_session,order_details):
                     for game in choice_options.items()
                     if set(find_dict_keys(game[1],"machine_name")).isdisjoint(chosen_games)
             ]
-            
             month["parent_identifier"] = identifier
             if len(month["available_choices"]):
                 yield month
 
 
 def _redeem_steam(session, key, quiet=False):
-    # Based on https://gist.github.com/snipplets/2156576c2754f8a4c9b43ccb674d5a5d
+    """
+    Redeem a Steam key. Returns error code (0 = success).
+    Based on https://gist.github.com/snipplets/2156576c2754f8a4c9b43ccb674d5a5d
+    """
     if key == "":
         return 0
     cookies_dict = session.cookies.get_dict()
@@ -750,14 +1423,24 @@ def _redeem_steam(session, key, quiet=False):
             print("Error: Steam sessionid cookie missing. Please re-login to Steam.")
         return 53  # Return error code
     session_id = cookies_dict["sessionid"]
-    r = session.post(
-        STEAM_REDEEM_API,
-        data={"product_key": key, "sessionid": session_id}
-    )
+    try:
+        r = session.post(
+            STEAM_REDEEM_API,
+            data={"product_key": key, "sessionid": session_id},
+            timeout=30
+        )
+    except requests.exceptions.Timeout:
+        if not quiet:
+            print("  -> Timeout while redeeming on Steam. This may be rate limiting or network issues.")
+        return 53
+    except requests.exceptions.RequestException as e:
+        if not quiet:
+            print(f"  -> Network error while redeeming on Steam: {e}")
+        return 53
     if r.status_code == 403:
         if not quiet:
             print(
-                "Steam responded with 403 Forbidden while redeeming. "
+                "  -> Steam responded with 403 Forbidden while redeeming. "
                 "This is likely rate limiting - Steam limits ~50 keys per hour."
             )
         return 53  # Return rate limit error code
@@ -766,12 +1449,13 @@ def _redeem_steam(session, key, quiet=False):
     except ValueError:
         # Steam occasionally returns HTML or empty responses; treat as transient failure
         body_preview = r.text[:200].replace("\n", " ")
-        print(f"Error: Steam redemption response was not JSON (status {r.status_code}). Body preview: {body_preview}")
+        if not quiet:
+            print(f"  -> Error: Steam redemption response was not JSON (status {r.status_code}). Body preview: {body_preview}")
         return 53
 
-    if blob["success"] == 1:
-        for item in blob["purchase_receipt_info"]["line_items"]:
-            print("Redeemed " + item["line_item_description"])
+    if blob.get("success") == 1:
+        for item in blob.get("purchase_receipt_info", {}).get("line_items", []):
+            print(f"  ✓ Redeemed {item.get('line_item_description', 'Unknown game')}")
         return 0
     else:
         error_code = blob.get("purchase_result_details")
@@ -782,69 +1466,32 @@ def _redeem_steam(session, key, quiet=False):
                 error_code = error_code.get("result_detail")
         error_code = error_code or 53
 
-        if error_code == 14:
-            error_message = (
-                "The product code you've entered is not valid. Please double check to see if you've "
-                "mistyped your key. I, L, and 1 can look alike, as can V and Y, and 0 and O. "
-            )
-        elif error_code == 15:
-            error_message = (
-                "The product code you've entered has already been activated by a different Steam account. "
-                "This code cannot be used again. Please contact the retailer or online seller where the "
-                "code was purchased for assistance. "
-            )
-        elif error_code == 53:
-            error_message = (
-                "There have been too many recent activation attempts from this account or Internet "
-                "address. Please wait and try your product code again later. "
-            )
-        elif error_code == 13:
-            error_message = (
-                "Sorry, but this product is not available for purchase in this country. Your product key "
-                "has not been redeemed. "
-            )
-        elif error_code == 9:
-            error_message = (
-                "This Steam account already owns the product(s) contained in this offer. To access them, "
-                "visit your library in the Steam client. "
-            )
-        elif error_code == 24:
-            error_message = (
-                "The product code you've entered requires ownership of another product before "
-                "activation.\n\nIf you are trying to activate an expansion pack or downloadable content, "
-                "please first activate the original game, then activate this additional content. "
-            )
-        elif error_code == 36:
-            error_message = (
-                "The product code you have entered requires that you first play this game on the "
-                "PlayStation®3 system before it can be registered.\n\nPlease:\n\n- Start this game on "
-                "your PlayStation®3 system\n\n- Link your Steam account to your PlayStation®3 Network "
-                "account\n\n- Connect to Steam while playing this game on the PlayStation®3 system\n\n- "
-                "Register this product code through Steam. "
-            )
-        elif error_code == 50:
-            error_message = (
-                "The code you have entered is from a Steam Gift Card or Steam Wallet Code. Browse here: "
-                "https://store.steampowered.com/account/redeemwalletcode to redeem it. "
-            )
-        else:
-            error_message = (
-                "An unexpected error has occurred.  Your product code has not been redeemed.  Please wait "
-                "30 minutes and try redeeming the code again.  If the problem persists, please contact <a "
-                'href="https://help.steampowered.com/en/wizard/HelpWithCDKey">Steam Support</a> for '
-                "further assistance. "
-            )
+        error_messages = {
+            14: "The product code you've entered is not valid. Please double check to see if you've mistyped your key.",
+            15: "The product code you've entered has already been activated by a different Steam account.",
+            53: "There have been too many recent activation attempts. Rate limited - wait and try again later.",
+            13: "Sorry, but this product is not available for purchase in this country.",
+            9: "This Steam account already owns the product(s) contained in this offer.",
+            24: "The product code you've entered requires ownership of another product before activation (DLC/expansion).",
+            36: "The product code requires that you first play this game on PlayStation®3.",
+            50: "The code you have entered is from a Steam Gift Card or Steam Wallet Code. Redeem at: https://store.steampowered.com/account/redeemwalletcode",
+        }
+        error_message = error_messages.get(
+            error_code,
+            f"An unexpected error has occurred (code {error_code}). Your product code has not been redeemed."
+        )
         if error_code != 53 or not quiet:
-            print(error_message)
+            print(f"  -> {error_message}")
         return error_code
 
 
-files = {}
+# Global dict for file handles
+# Removed global files dict - now using context managers for proper file handling
 
 
-def write_key(code, key):
-    global files
-
+@contextmanager
+def get_csv_writer(code):
+    """Context manager for CSV file writing. Ensures files are properly closed."""
     filename = "redeemed.csv"
     if code == 15 or code == 9:
         filename = "already_owned.csv"
@@ -852,19 +1499,30 @@ def write_key(code, key):
         filename = "expired.csv"
     elif code != 0:
         filename = "errored.csv"
+    
+    # Check if we need to write header
+    file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
+    
+    with open(filename, "a", encoding="utf-8-sig") as f:
+        if file_needs_header:
+            f.write("gamekey,human_name,redeemed_key_val\n")
+        yield f
 
-    if filename not in files:
-        files[filename] = open(filename, "a", encoding="utf-8-sig")
-    key["human_name"] = key["human_name"].replace(",", ".")
-    gamekey = key.get('gamekey')
-    human_name = key.get("human_name")
-    redeemed_key_val = key.get("redeemed_key_val")
+
+def write_key(code, key):
+    """Write key to appropriate CSV file based on redemption result."""
+    gamekey = key.get('gamekey', '')
+    human_name = key.get('human_name', '').replace(",", ".")
+    redeemed_key_val = key.get("redeemed_key_val", '')
     output = f"{gamekey},{human_name},{redeemed_key_val}\n"
-    files[filename].write(output)
-    files[filename].flush()
+    
+    with get_csv_writer(code) as f:
+        f.write(output)
+        f.flush()
 
 
 def prompt_skipped(skipped_games):
+    """Allow user to review and filter skipped games."""
     global AUTO_MODE
     user_filtered = []
     with open("skipped.txt", "w", encoding="utf-8-sig") as file:
@@ -875,20 +1533,18 @@ def prompt_skipped(skipped_games):
         f"Inside skipped.txt is a list of {len(skipped_games)} games that we think you already own, but aren't "
         f"completely sure "
     )
-    
     if AUTO_MODE:
         print("(auto-mode: skipping all uncertain games)")
         # In auto mode, skip all uncertain games (safer)
         if os.path.exists("skipped.txt"):
             os.remove("skipped.txt")
         return []
-    
     try:
         input(
             "Feel free to REMOVE from that list any games that you would like to try anyways, and when done press "
             "Enter to confirm. "
         )
-    except SyntaxError:
+    except (KeyboardInterrupt, EOFError):
         pass
     if os.path.exists("skipped.txt"):
         with open("skipped.txt", "r", encoding="utf-8-sig") as file:
@@ -904,12 +1560,12 @@ def prompt_skipped(skipped_games):
 
 
 def prompt_yes_no(question, default_yes=True):
+    """Prompt user for yes/no answer. Returns True for yes, False for no."""
     global AUTO_MODE
     if AUTO_MODE:
         answer = "y" if default_yes else "n"
         print(f"{question} [{answer}] (auto-mode)")
         return default_yes
-    
     ans = None
     answers = ["y","n"]
     while ans not in answers:
@@ -923,7 +1579,46 @@ def prompt_yes_no(question, default_yes=True):
             return True if ans == "y" else False
 
 
+def _load_cache(cache_key, max_age_hours=24):
+    """Load cached data if it exists and is not expired. Returns (data, is_valid) tuple."""
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    if not cache_file.exists():
+        return None, False
+    
+    try:
+        with cache_file.open("r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+        
+        # Check expiration
+        cached_time = datetime.fromisoformat(cache_data.get("cached_at", ""))
+        age = datetime.now() - cached_time
+        if age > timedelta(hours=max_age_hours):
+            return None, False
+        
+        return cache_data.get("data"), True
+    except (json.JSONDecodeError, ValueError, KeyError, OSError) as e:
+        print(f"[DEBUG] Cache load error for {cache_key}: {e}")
+        return None, False
+
+
+def _save_cache(cache_key, data):
+    """Save data to cache with timestamp."""
+    cache_file = CACHE_DIR / f"{cache_key}.json"
+    try:
+        cache_data = {
+            "cached_at": datetime.now().isoformat(),
+            "data": data
+        }
+        with cache_file.open("w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+        return True
+    except (OSError, TypeError) as e:
+        print(f"[DEBUG] Cache save error for {cache_key}: {e}")
+        return False
+
+
 def _load_steam_api_key(path="steam_api_key.txt"):
+    """Load Steam API key from file or prompt user."""
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -945,8 +1640,15 @@ def _load_steam_api_key(path="steam_api_key.txt"):
 
         print("Steam API key cannot be empty. Please try again.")
 
+
 def _fetch_all_apps(steam_session):
-    # Steam limits app list responses; paginate until exhausted.
+    """Fetch complete Steam app list via API. Returns list of app dicts. Uses cache (7 days)."""
+    # Try to load from cache first (cache for 7 days - Steam app list changes rarely)
+    cached_data, is_valid = _load_cache("steam_app_list", max_age_hours=24*7)
+    if is_valid:
+        print(f"Using cached Steam app list ({len(cached_data)} apps)")
+        return cached_data
+    
     api_key = _load_steam_api_key()
     url = "https://api.steampowered.com/IStoreService/GetAppList/v1/"
     params = {
@@ -958,11 +1660,19 @@ def _fetch_all_apps(steam_session):
         "include_hardware": True
     }
 
-    print("Fetching partial Steam app list... (this may take a few moments)")
+    print("Fetching Steam app list... (this may take a few moments)")
 
     apps = []
     while True:
-        resp = steam_session.get(url, params=params)
+        try:
+            resp = steam_session.get(url, params=params, timeout=30)
+        except requests.exceptions.Timeout:
+            print("Timeout while fetching Steam app list. Retrying...")
+            time.sleep(5)
+            continue
+        except requests.exceptions.RequestException as e:
+            print(f"Network error while fetching Steam app list: {e}")
+            break
         if resp.status_code == 403:
             print(
                 "Steam responded with 403 Forbidden while fetching the app list. "
@@ -970,7 +1680,11 @@ def _fetch_all_apps(steam_session):
             )
             sys.exit(1)
 
-        body = resp.json().get("response", {})
+        try:
+            body = resp.json().get("response", {})
+        except ValueError:
+            print("Error: Steam app list response was not JSON. Stopping fetch.")
+            break
         page = body.get("apps", [])
         apps.extend(page)
 
@@ -978,21 +1692,46 @@ def _fetch_all_apps(steam_session):
             break
 
         params["last_appid"] = body.get("last_appid", params.get("last_appid", 0))
-    
     print(f"Fetched {len(apps)} total apps available on Steam Store.")
+    
+    # Save to cache
+    _save_cache("steam_app_list", apps)
+    print("Cached Steam app list for future use.")
 
     return apps
 
 
 def _fetch_missing_app_details(steam_session, app_ids):
+    """Fetch app details for apps not in main catalog. Returns dict of {appid: name}. Uses cache (7 days)."""
     if not app_ids:
         return {}
+    
+    # Try to load from cache first
+    cache_key = f"missing_app_details_{hash(tuple(sorted(app_ids)))}"
+    cached_data, is_valid = _load_cache(cache_key, max_age_hours=24*7)
+    if is_valid:
+        print(f"Using cached app details for {len(cached_data)} apps")
+        return cached_data
+    
+    # Also check individual app caches
+    cached_apps = {}
+    uncached_app_ids = []
+    for appid in app_ids:
+        app_cache, is_valid = _load_cache(f"app_detail_{appid}", max_age_hours=24*7)
+        if is_valid and app_cache:
+            cached_apps[appid] = app_cache
+        else:
+            uncached_app_ids.append(appid)
+    
+    if not uncached_app_ids:
+        return cached_apps
 
     def fetch_app(appid):
         try:
             resp = steam_session.get(
                 "https://store.steampowered.com/api/appdetails",
                 params={"appids": appid},
+                timeout=10
             ).json()
             app_data = resp.get(str(appid), {})
             if app_data.get("success") and app_data.get("data"):
@@ -1003,10 +1742,18 @@ def _fetch_missing_app_details(steam_session, app_ids):
             return None
         return None
 
-    with ThreadPoolExecutor(max_workers=max(1, min(8, len(app_ids)))) as executor:
-        results = list(executor.map(fetch_app, app_ids))
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(uncached_app_ids)))) as executor:
+        results = list(executor.map(fetch_app, uncached_app_ids))
 
     resolved = dict(result for result in results if result is not None)
+    # Merge with cached apps
+    resolved.update(cached_apps)
+    
+    # Cache individual app details
+    for appid, name in resolved.items():
+        if appid not in cached_apps:
+            _save_cache(f"app_detail_{appid}", name)
+    
     unresolved = [appid for appid in app_ids if appid not in resolved]
 
     if unresolved:
@@ -1026,7 +1773,21 @@ def _fetch_missing_app_details(steam_session, app_ids):
 
 
 def get_owned_apps(steam_session):
-    resp = steam_session.get(STEAM_USERDATA_API)
+    """Get dict of owned Steam apps: {appid: name}. Uses cache (1 hour)."""
+    # Try to load from cache first (cache for 1 hour - owned apps change when user buys games)
+    cached_data, is_valid = _load_cache("owned_apps", max_age_hours=1)
+    if is_valid:
+        print(f"Using cached owned apps list ({len(cached_data)} apps)")
+        return cached_data
+    
+    try:
+        resp = steam_session.get(STEAM_USERDATA_API, timeout=30)
+    except requests.exceptions.Timeout:
+        print("Timeout while fetching owned apps from Steam.")
+        return {}
+    except requests.exceptions.RequestException as e:
+        print(f"Network error while fetching owned apps: {e}")
+        return {}
     try:
         owned_content = resp.json()
     except ValueError:
@@ -1036,14 +1797,13 @@ def get_owned_apps(steam_session):
             f"Body preview: {preview}"
         )
         return {}
-    owned_app_ids = owned_content["rgOwnedPackages"] + owned_content["rgOwnedApps"]
+    owned_app_ids = owned_content.get("rgOwnedPackages", []) + owned_content.get("rgOwnedApps", [])
     all_app_ids = _fetch_all_apps(steam_session)
 
     # Index known apps from the catalog
     app_index = {app["appid"]: app["name"] for app in all_app_ids}
 
     # Fallback: the new catalog endpoint omits store-disabled apps, so look them up directly.
-    # Even with this, some apps may still be missing as Steam doesn't provide a full public catalog anymore and Humble may have ids for bundles/discontinued apps.
     unindexed_app_ids = [
         appid
         for appid in owned_content.get("rgOwnedApps", [])
@@ -1058,29 +1818,37 @@ def get_owned_apps(steam_session):
         for appid in owned_content.get("rgOwnedApps", [])
         if appid in app_index
     }
+    
+    # Save to cache
+    _save_cache("owned_apps", owned_app_details)
+    print(f"Cached owned apps list ({len(owned_app_details)} apps) for future use.")
 
     return owned_app_details
 
+
 def match_ownership(owned_app_details, game, filter_live):
+    """
+    Check if a game matches any owned Steam apps.
+    Returns (match_score, appid) tuple.
+    """
     threshold = 70
     best_match = (0, None)
     # Do a string search based on product names.
     matches = [
-        (fuzz.token_set_ratio(appname, game["human_name"]), appid)
+        (fuzz.token_set_ratio(appname, game['human_name']), appid)
         for appid, appname in owned_app_details.items()
     ]
     refined_matches = [
-        (fuzz.token_sort_ratio(owned_app_details[appid], game["human_name"]), appid)
+        (fuzz.token_sort_ratio(owned_app_details[appid], game['human_name']), appid)
         for score, appid in matches
         if score > threshold
     ]
-    
     if filter_live and len(refined_matches) > 0:
         cls()
         best_match = max(refined_matches, key=lambda item: item[0])
         if best_match[0] == 100:
             return best_match
-        print("steam games you own")
+        print(f"Steam games you own that might match '{game['human_name']}':")
         for match in refined_matches:
             print(f"     {owned_app_details[match[1]]}: {match[0]}")
         if prompt_yes_no(f"Is \"{game['human_name']}\" in the above list?"):
@@ -1096,59 +1864,66 @@ def match_ownership(owned_app_details, game, filter_live):
             best_match = (0,None)
     return best_match
 
+
 def prompt_filter_live():
+    """Ask user if they want to interactively filter owned games."""
     global AUTO_MODE
     if AUTO_MODE:
         print("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [n] (auto-mode)")
         return "n"
-    
     mode = None
     while mode not in ["y","n"]:
-        mode = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/n] ").strip()
+        mode = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/n] ").strip().lower()
         if mode in ["y","n"]:
             return mode
         else:
             print("Enter y or n")
     return mode
 
+
 def retry_errored_keys(humble_session, steam_session, order_details):
-    """Retry keys that previously errored."""
+    """Retry keys that previously errored (especially rate-limited ones)."""
     if order_details is None:
         return  # Can't retry without order details
-    
     errored_file = "errored.csv"
     if not os.path.exists(errored_file):
         return
-    
     # Read errored keys
     errored_keys = []
     try:
         with open(errored_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
-            next(reader, None)  # Skip header if present
+            # Skip header if present
+            first_row = next(reader, None)
+            if first_row and first_row[0].lower() != "gamekey":
+                # First row is data, not header
+                if len(first_row) >= 3:
+                    gamekey, human_name, redeemed_key_val = first_row[0], first_row[1], first_row[2]
+                    errored_keys.append({
+                        "gamekey": gamekey,
+                        'human_name': human_name,
+                        "redeemed_key_val": redeemed_key_val
+                    })
+            # Read remaining rows
             for row in reader:
                 if len(row) >= 3:
                     gamekey, human_name, redeemed_key_val = row[0], row[1], row[2]
                     errored_keys.append({
                         "gamekey": gamekey,
-                        "human_name": human_name,
+                        'human_name': human_name,
                         "redeemed_key_val": redeemed_key_val
                     })
     except Exception as e:
         print(f"Error reading {errored_file}: {e}")
         return
-    
     if not errored_keys:
         return
-    
     print(f"\n{'='*60}")
     print(f"Retrying {len(errored_keys)} previously errored keys...")
     print(f"{'='*60}\n")
-    
     # Match errored keys back to order_details
     all_steam_keys = list(find_dict_keys(order_details, "steam_app_id", True))
     keys_to_retry = []
-    
     for errored in errored_keys:
         # Try to find matching key in order_details
         for key in all_steam_keys:
@@ -1158,23 +1933,18 @@ def retry_errored_keys(humble_session, steam_session, order_details):
                 key["redeemed_key_val"] = errored["redeemed_key_val"]
                 keys_to_retry.append(key)
                 break
-    
     if not keys_to_retry:
         print("No matching keys found in order details to retry.")
         return
-    
     print(f"Found {len(keys_to_retry)} keys to retry out of {len(errored_keys)} errored.\n")
-    
     # Retry the keys
     total_retry = len(keys_to_retry)
     for idx, key in enumerate(keys_to_retry, 1):
         remaining = total_retry - idx + 1
         print(f"[RETRY {idx}/{total_retry}] {key['human_name']} ({remaining} remaining)")
-        
         if not valid_steam_key(key["redeemed_key_val"]):
             print(f"  -> Invalid key format, skipping")
             continue
-        
         code = _redeem_steam(steam_session, key["redeemed_key_val"])
         retry_interval = 300  # 5 minutes between retries
         seconds_waited = 0
@@ -1192,18 +1962,45 @@ def retry_errored_keys(humble_session, steam_session, order_details):
                 code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
                 if code == 53:
                     print("Still rate limited.")
-        
-        if code == 53:
+        if code != 53:
             print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
-        
         write_key(code, key)
-    
     print(f"\n{'='*60}")
     print(f"Completed retry pass: {total_retry} keys processed")
     print(f"{'='*60}\n")
 
 
+
+# Add a session keep-alive mechanism
+class SessionKeepAlive:
+    """Periodically performs lightweight operations to keep the session alive."""
+    def __init__(self, driver, interval=300):
+        self.driver = driver
+        self.interval = interval
+        self.last_keepalive = time.time()
+        self.enabled = True
+    def check(self):
+        """Check if keep-alive is needed and perform it."""
+        if not self.enabled:
+            return
+        current_time = time.time()
+        if current_time - self.last_keepalive >= self.interval:
+            try:
+                if validate_session(self.driver):
+                    _ = self.driver.title  # Lightweight operation
+                    self.last_keepalive = current_time
+                else:
+                    print(f"[DEBUG] Session validation failed during keep-alive")
+                    self.enabled = False
+            except Exception:
+                self.enabled = False
+    def disable(self):
+        """Disable keep-alive."""
+        self.enabled = False
+
+
 def redeem_steam_keys(humble_session, humble_keys, order_details=None):
+    """Main function to redeem Steam keys. Returns Steam session for retries."""
     session = steam_login()
 
     print("Successfully signed in on Steam.")
@@ -1212,7 +2009,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     # Query owned App IDs according to Steam
     owned_app_details = get_owned_apps(session)
 
-    noted_keys = [key for key in humble_keys if key["steam_app_id"] not in owned_app_details.keys()]
+    noted_keys = [key for key in humble_keys if key.get("steam_app_id") not in owned_app_details.keys()]
     skipped_games = {}
     unownedgames = []
 
@@ -1224,7 +2021,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     for game in noted_keys:
         best_match = match_ownership(owned_app_details,game,filter_live)
         if best_match[1] is not None and best_match[1] in owned_app_details.keys():
-            skipped_games[game["human_name"].strip()] = game
+            skipped_games[game['human_name'].strip()] = game
         else:
             unownedgames.append(game)
 
@@ -1240,29 +2037,41 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         print("{} keys will be attempted.".format(len(unownedgames)))
         # Preserve original order
         unownedgames = sorted(unownedgames,key=lambda g: humble_keys.index(g))
-    
     total_to_redeem = len(unownedgames)
     print(f"\n{'='*60}")
     print(f"Starting redemption: {total_to_redeem} keys to process")
     print(f"{'='*60}\n")
-    
+    # Initialize keep-alive for Humble session
+    keepalive = SessionKeepAlive(humble_session, interval=300)  # 5 minutes
     redeemed = []
+    
+    # Track rate limiting statistics
+    rate_limit_count = 0
+    rate_limit_total_wait_time = 0
 
     for idx, key in enumerate(unownedgames, 1):
+        # Check keep-alive periodically
+        keepalive.check()
         remaining = total_to_redeem - idx + 1
         print(f"[{idx}/{total_to_redeem}] {key['human_name']} ({remaining} remaining)")
 
-        if key["human_name"] in redeemed or (key["steam_app_id"] != None and key["steam_app_id"] in redeemed):
+        if key['human_name'] in redeemed or (key.get("steam_app_id") != None and key["steam_app_id"] in redeemed):
             # We've bumped into a repeat of the same game!
             write_key(9,key)
             continue
         else:
-            if key["steam_app_id"] != None:
+            if key.get("steam_app_id") != None:
                 redeemed.append(key["steam_app_id"])
-            redeemed.append(key["human_name"])
+            redeemed.append(key['human_name'])
 
         if "redeemed_key_val" not in key:
-            # This key is unredeemed via Humble, trigger redemption process.
+            # Validate session before redemption
+            if not validate_session(humble_session):
+                print(f"  -> Session invalid, attempting recovery...")
+                if not refresh_page_if_needed(humble_session, "https://www.humblebundle.com/home/library"):
+                    print(f"  -> Failed to recover session, marking as errored")
+                    write_key(1, key)
+                    continue
             redeemed_key = redeem_humble_key(humble_session, key)
             key["redeemed_key_val"] = redeemed_key
             # Worth noting this will only persist for this loop -- does not get saved to unownedgames' obj
@@ -1281,6 +2090,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         code = _redeem_steam(session, key["redeemed_key_val"])
         retry_interval = 300  # 5 minutes between retries (rate limit lasts ~1 hour)
         seconds_waited = 0
+        rate_limited_this_key = False
         while code == 53:
             """NOTE
             Steam seems to limit to about 50 keys/hr -- even if all 50 keys are legitimate *sigh*
@@ -1288,6 +2098,10 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             Duplication counts towards Steam's _failure rate limit_,
             hence why we've worked so hard above to figure out what we already own
             """
+            if not rate_limited_this_key:
+                rate_limited_this_key = True
+                rate_limit_count += 1
+            
             minutes_waited = seconds_waited // 60
             next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
             print(
@@ -1296,28 +2110,39 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             )
             time.sleep(10)
             seconds_waited += 10
+            rate_limit_total_wait_time += 10
+            # Keep session alive during wait
+            if seconds_waited % 60 == 0:  # Every minute
+                keepalive.check()
             if seconds_waited % retry_interval == 0:
                 # Try again every 5 minutes
                 print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
                 if code == 53:
                     print("Still rate limited.")
-        
-        if code == 53:
+        if code != 53:
             # Rate limit cleared, show remaining count
-            print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
+            if rate_limited_this_key:
+                total_wait_minutes = seconds_waited // 60
+                print(f"\n✓ Rate limit cleared after waiting {total_wait_minutes} minutes! Continuing with {remaining} keys remaining...\n")
+            else:
+                print(f"\n✓ Continuing with {remaining} keys remaining...\n")
 
         write_key(code, key)
-    
+    keepalive.disable()
     print(f"\n{'='*60}")
     print(f"Completed initial pass: {total_to_redeem} keys processed")
+    if rate_limit_count > 0:
+        total_wait_hours = rate_limit_total_wait_time // 3600
+        total_wait_minutes = (rate_limit_total_wait_time % 3600) // 60
+        print(f"Rate limiting encountered: {rate_limit_count} key(s) hit rate limit")
+        print(f"Total wait time: {total_wait_hours}h {total_wait_minutes}m")
     print(f"{'='*60}\n")
-    
-    # Return session for retrying errored keys
     return session
 
 
 def export_mode(humble_session,order_details):
+    """Export mode - export keys to CSV."""
     cls()
 
     export_key_headers = [
@@ -1338,26 +2163,23 @@ def export_mode(humble_session,order_details):
     owned_app_details = None
 
     keys = []
-    
     print("Please configure your export:")
     export_steam_only = prompt_yes_no("Export only Steam keys?")
     export_revealed = prompt_yes_no("Export revealed keys?")
     export_unrevealed = prompt_yes_no("Export unrevealed keys?")
     if(not export_revealed and not export_unrevealed):
         print("That leaves 0 keys...")
-        sys.exit()
+        sys.exit(1)
     if(export_unrevealed):
         reveal_unrevealed = prompt_yes_no("Reveal all unrevealed keys? (This will remove your ability to claim gift links on these)")
         if(reveal_unrevealed):
             extra = "Steam " if export_steam_only else ""
             confirm_reveal = prompt_yes_no(f"Please CONFIRM that you would like ALL {extra}keys on Humble to be revealed, this can't be undone.")
     steam_config = prompt_yes_no("Would you like to sign into Steam to detect ownership on the export data?")
-    
     if(steam_config):
         steam_session = steam_login()
         if(verify_logins_session(steam_session)[1]):
             owned_app_details = get_owned_apps(steam_session)
-    
     desired_keys = "steam_app_id" if export_steam_only else "key_type_human_name"
     keylist = list(find_dict_keys(order_details,desired_keys,True))
 
@@ -1366,13 +2188,12 @@ def export_mode(humble_session,order_details):
         export = (export_revealed and revealed) or (export_unrevealed and not revealed)
 
         if(export):
-            if(export_unrevealed and confirm_reveal):
+            if(export_unrevealed and confirm_reveal and not revealed):
                 # Redeem key if user requests all keys to be revealed
                 tpk["redeemed_key_val"] = redeem_humble_key(humble_session,tpk)
-            
             if(owned_app_details != None and "steam_app_id" in tpk):
                 # User requested Steam Ownership info
-                owned = tpk["steam_app_id"] in owned_app_details.keys()
+                owned = tpk.get("steam_app_id") in owned_app_details.keys()
                 if(not owned):
                     # Do a search to see if user owns it
                     best_match = match_ownership(owned_app_details,tpk,False)
@@ -1382,9 +2203,7 @@ def export_mode(humble_session,order_details):
             # Surface IDs and expiry information for auditing mismatches
             tpk["humble_steam_app_id"] = tpk.get("steam_app_id")
             tpk["humble_expired_at"] = tpk.get("expiry_date")
-            
             keys.append(tpk)
-    
     ts = time.strftime("%Y%m%d-%H%M%S")
     filename = f"humble_export_{ts}.csv"
     with open(filename, 'w', encoding="utf-8-sig") as f:
@@ -1393,28 +2212,28 @@ def export_mode(humble_session,order_details):
             row = []
             for col in export_key_headers:
                 if col in key:
-                    row.append("\"" + str(key[col]) + "\"")
+                    row.append("\"" + str(key[col]).replace('"', '""') + "\"")  # Escape quotes
                 else:
                     row.append("")
             f.write(','.join(row)+"\n")
-    
     print(f"Exported to {filename}")
 
 
 def choose_games(humble_session,choice_month_name,identifier,chosen):
+    """Choose games from Humble Choice month."""
     for choice in chosen:
         display_name = choice["display_item_machine_name"]
         if "tpkds" not in choice:
             webbrowser.open(f"{HUMBLE_SUB_PAGE}{choice_month_name}/{display_name}")
         else:
             payload = {
-                "gamekey":choice["tpkds"][0]["gamekey"],
+                "gamekey":choice['tpkds'][0]['gamekey'],    
                 "parent_identifier":identifier,
                 "chosen_identifiers[]":display_name,
                 "is_multikey_and_from_choice_modal":"false"
             }
             status,res = perform_post(humble_session,HUMBLE_CHOOSE_CONTENT,payload)
-            if not ("success" in res or not res["success"]):
+            if not ("success" in res and res["success"]):
                 print("Error choosing " + choice["title"])
                 print(res)
             else:
@@ -1422,45 +2241,45 @@ def choose_games(humble_session,choice_month_name,identifier,chosen):
 
 
 def humble_chooser_mode(humble_session,order_details):
+    """Humble Choice chooser mode - select games from Humble Choice months."""
     try_redeem_keys = []
     months = get_choices(humble_session,order_details)
     count = 0
     first = True
+    redeem_keys = False
     for month in months:
         redeem_all = None
         if(first):
             redeem_keys = prompt_yes_no("Would you like to auto-redeem these keys after? (Will require Steam login)")
             first = False
-        
         ready = False
         while not ready:
             cls()
-            if month["choice_data"]["usesChoices"]:
-                remaining = month["choices_remaining"]
+            if month["choice_data"].get("usesChoices", True):
+                remaining = month.get("choices_remaining", 0)
                 print()
-                print(month["product"]["human_name"])
+                print(month.get("product", {}).get('human_name', 'Unknown Month'))
                 print(f"Choices remaining: {remaining}")
             else:
-                remaining = len(month["available_choices"])
+                remaining = len(month.get("available_choices", []))
             print("Available Games:\n")
-            choices = month["available_choices"]
+            choices = month.get("available_choices", [])
             for idx,choice in enumerate(choices):
-                title = choice["title"]
+                title = choice.get("title", "Unknown")
                 rating_text = ""
-                if("review_text" in choice["user_rating"] and "steam_percent|decimal" in choice["user_rating"]):
+                if "user_rating" in choice and "review_text" in choice["user_rating"] and "steam_percent|decimal" in choice["user_rating"]:
                     rating = choice["user_rating"]["review_text"].replace('_',' ')
                     percentage = str(int(choice["user_rating"]["steam_percent|decimal"]*100)) + "%"
                     rating_text = f" - {rating}({percentage})"
                 exception = ""
                 if "tpkds" not in choice:
-                    # These are weird cases that should be handled by Humble.
+                    # These are weird cases that should be handled by Humble directly.
                     exception = " (Must be redeemed through Humble directly)"
                 print(f"{idx+1}. {title}{rating_text}{exception}")
             if(redeem_all == None and remaining == len(choices)):
                 redeem_all = prompt_yes_no("Would you like to redeem all?")
             else:
                 redeem_all = False
-            
             if(redeem_all):
                 user_input = [str(i+1) for i in range(0,len(choices))]
             else:
@@ -1473,15 +2292,19 @@ def humble_chooser_mode(humble_session,order_details):
                 print(f"Or type just 'link' to go to the webpage for this month {auto_redeem_note}")
                 print("Or just press Enter to move on.")
 
-                user_input = [uinput.strip() for uinput in input().split(',') if uinput.strip() != ""]
+                try:
+                    user_input = [uinput.strip() for uinput in input().split(',') if uinput.strip() != ""]
+                except (KeyboardInterrupt, EOFError):
+                    user_input = []
 
             if(len(user_input) == 0):
                 ready = True
             elif(user_input[0].lower() == 'link'):
-                webbrowser.open(HUMBLE_SUB_PAGE + month["product"]["choice_url"])
+                webbrowser.open(HUMBLE_SUB_PAGE + month.get("product", {}).get("choice_url", ""))
                 if redeem_keys:
                     # May have redeemed keys on the webpage.
-                    try_redeem_keys.append(month["gamekey"])
+                    try_redeem_keys.append(month.get("gamekey", ""))
+                ready = True
             else:
                 invalid_option = lambda option: (
                     not option.isnumeric()
@@ -1504,14 +2327,14 @@ def humble_chooser_mode(humble_session,order_details):
                     else:
                         print("\nGames selected:")
                         for choice in chosen:
-                            print(choice["title"])
+                            print(choice.get("title", "Unknown"))
                         confirmed = prompt_yes_no("Please type 'y' to confirm your selection")
                         if confirmed:
-                            choice_month_name = month["product"]["choice_url"]
-                            identifier = month["parent_identifier"]
+                            choice_month_name = month.get("product", {}).get("choice_url", "")
+                            identifier = month.get("parent_identifier", "")
                             choose_games(humble_session,choice_month_name,identifier,chosen)
                             if redeem_keys:
-                                try_redeem_keys.append(month["gamekey"])
+                                try_redeem_keys.append(month.get("gamekey", ""))
                             ready = True
     if(first):
         print("No Humble Choices need choosing! Look at you all up-to-date!")
@@ -1519,104 +2342,639 @@ def humble_chooser_mode(humble_session,order_details):
         print("No more unchosen Humble Choices")
         if(redeem_keys and len(try_redeem_keys) > 0):
             print("Redeeming keys now!")
-            updated_monthlies = humble_session.execute_async_script(getHumbleOrders.replace('%optional%',json.dumps(try_redeem_keys)))
-            chosen_keys = list(find_dict_keys(updated_monthlies,"steam_app_id",True))
-            steam_session = redeem_steam_keys(humble_session, chosen_keys, updated_monthlies)
-            retry_errored_keys(humble_session, steam_session, updated_monthlies)
+            try:
+                updated_monthlies = humble_session.execute_async_script(getHumbleOrders.replace('%optional%',json.dumps(try_redeem_keys)))
+                if isinstance(updated_monthlies, dict) and 'error' in updated_monthlies:
+                    print(f"Error fetching updated monthly data: {updated_monthlies.get('message', 'Unknown error')}")
+                else:
+                    chosen_keys = list(find_dict_keys(updated_monthlies,"steam_app_id",True))
+                    steam_session = redeem_steam_keys(humble_session, chosen_keys, updated_monthlies)
+                    retry_errored_keys(humble_session, steam_session, updated_monthlies)
+            except Exception as e:
+                print(f"Error during key redemption: {e}")
+
 
 def cls():
+    """Clear screen (unless in auto mode to preserve logs)."""
     # Don't clear screen in auto mode - we want to preserve the log
     if not AUTO_MODE:
         os.system('cls' if os.name=='nt' else 'clear')
     print_main_header()
 
+
 def print_main_header():
+    """Print script header."""
     if not AUTO_MODE:
         print("-=FailSpy's Humble Bundle Helper!=-")
     print("--------------------------------------")
-    
+
+
 if __name__=="__main__":
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Humble Bundle Steam Key Redeemer')
-    parser.add_argument('--auto', action='store_true', 
-                        help='Auto mode: automatically answer prompts (requires existing login cookies)')
-    args = parser.parse_args()
-    
-    if args.auto:
-        AUTO_MODE = True
-        print("="*50)
-        print("RUNNING IN AUTO MODE")
-        print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        print("="*50)
-    
-    # Always start headless - only switch to visible if manual login is needed
-    print("Starting browser...", end=" ", flush=True)
-    driver = get_browser_driver(headless=True)
-    print("Logging in to Humble...", end=" ", flush=True)
-    driver, _ = humble_login(driver, is_headless=True)
-    print("OK")
-
-    print("Fetching order details...", end=" ", flush=True)
-
-    order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
-    print("OK")
-
-    desired_mode = prompt_mode(order_details,driver)
-    if(desired_mode == "2"):
-        export_mode(driver,order_details)
-        sys.exit()
-    if(desired_mode == "3"):
-        humble_chooser_mode(driver,order_details)
-        sys.exit()
-
-    # Auto-Redeem mode
-    cls()
-    unrevealed_keys = []
-    revealed_keys = []
-    steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
-    total_steam_keys = len(steam_keys)
-
-    filters = ["errored.csv", "already_owned.csv", "redeemed.csv", "expired.csv"]
-    original_length = len(steam_keys)
-    for filter_file in filters:
+    driver = None
+    try:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description='Humble Bundle Steam Key Redeemer')
+        parser.add_argument('--auto', action='store_true', 
+                            help='Auto mode: automatically answer prompts (requires existing login cookies)')
+        args = parser.parse_args()
+        if args.auto:
+            AUTO_MODE = True
+            print("="*50)
+            print("RUNNING IN AUTO MODE")
+            print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print("="*50)
+        # Always start headless - only switch to visible if manual login is needed
+        print("Starting browser...", end=" ", flush=True)
+        driver = get_browser_driver(headless=True)
+        print("OK")
+        print("Logging in to Humble...", end=" ", flush=True)
+        driver, _ = humble_login(driver, is_headless=True)
+        print("OK")
+        # Verify session is still valid before fetching order details
+        print("Verifying session...", end=" ", flush=True)
         try:
-            with open(filter_file, "r") as f:
-                keycols = f.read()
-            filtered_keys = [keycol.strip() for keycol in keycols.replace("\n", ",").split(",")]
-            steam_keys = [key for key in steam_keys if key.get("redeemed_key_val",False) not in filtered_keys]
-        except FileNotFoundError:
-            pass
-    filtered_count = original_length - len(steam_keys)
-    unredeemed_count = len(steam_keys)
-    if filtered_count > 0:
-        print(f"Found {total_steam_keys} Steam keys, {filtered_count} already processed, {unredeemed_count} unredeemed")
-    else:
-        print(f"Found {total_steam_keys} Steam keys, {unredeemed_count} unredeemed")
+            is_valid = verify_logins_session(driver)[0]
+            if not is_valid:
+                print("FAILED")
+                print("\nError: Humble session has expired or is invalid.")
+                if AUTO_MODE:
+                    print("The login cookies are stale. Please run the script manually to re-login:")
+                    print("  python3 humblesteamkeysredeemer.py")
+                    print("Then restart the daemon.")
+                    driver.quit()
+                    sys.exit(2)  # Exit code 2 = stale cookies
+                else:
+                    print("Please log in again.")
+                    driver.quit()
+                    sys.exit(1)
+            print("OK")
+        except Exception as e:
+            print("FAILED")
+            print(f"\nError verifying session: {e}")
+            driver.quit()
+            sys.exit(1)
 
-    for key in steam_keys:
-        if "redeemed_key_val" in key:
-            revealed_keys.append(key)
+        # Navigate to Humble Bundle page first to ensure we're in the right context for API calls
+        print("Loading Humble Bundle page...", end=" ", flush=True)
+        try:
+            driver.get("https://www.humblebundle.com/home/library")
+            time.sleep(2)  # Let page load
+            
+            # Check if page loaded properly
+            try:
+                page_title = driver.title
+                print(f"OK (page title: {page_title[:30]}...)")
+                
+                # Check for Cloudflare challenge
+                page_source_preview = driver.page_source[:1000].lower()
+                if "challenge" in page_title.lower() or "cloudflare" in page_source_preview:
+                    print("WARNING: Possible Cloudflare challenge detected!")
+                    print("The page may be blocking automated access.")
+            except:
+                print("OK")
+        except Exception as e:
+            print("FAILED")
+            print(f"\nError loading Humble Bundle page: {e}")
+            driver.quit()
+            sys.exit(1)
+        # Try to load order details from cache first (cache for 1 hour)
+        order_details = None
+        cached_order_details, is_valid = _load_cache("humble_order_details", max_age_hours=1)
+        if is_valid:
+            print("Using cached order details")
+            order_details = cached_order_details
         else:
-            # Has not been revealed via Humble yet
-            unrevealed_keys.append(key)
+            print("Fetching order details...", end=" ", flush=True)
+            try:
+                # Create interrupt event for Ctrl+C handling
+                interrupt_event = threading.Event()
+                # Store driver PID for force-kill if needed
+                driver_pid = None
+                try:
+                    driver_pid = driver.service.process.pid if hasattr(driver, 'service') and hasattr(driver.service, 'process') else None
+                except:
+                    pass
+                
+                # Update signal handler to use this event
+                process_quit(driver, interrupt_event)
+                
+                result = [None]
+                exception = [None]
+                thread_started = threading.Event()
+                
+                def execute_script():
+                    try:
+                        thread_started.set()  # Signal that thread has started
+                        print("[DEBUG] Thread started, executing async script", file=sys.stderr, flush=True)
+                        result[0] = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
+                        print("[DEBUG] Script execution completed", file=sys.stderr, flush=True)
+                    except KeyboardInterrupt:
+                        interrupt_event.set()
+                        exception[0] = KeyboardInterrupt("Interrupted by user")
+                    except Exception as e:
+                        print(f"[DEBUG] Exception in script thread: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                        exception[0] = e
+                
+                script_thread = threading.Thread(target=execute_script, name="HumbleOrderFetcher")
+                script_thread.daemon = True
+                script_thread.start()
+                
+                # Wait for thread to actually start
+                thread_started.wait(timeout=5)
+                if not thread_started.is_set():
+                    print(" FAILED")
+                    print("\nError: Thread failed to start")
+                    driver.quit()
+                    sys.exit(1)
+                
+                # Wait with progress indicator and interruptible joins
+                timeout_seconds = SCRIPT_TIMEOUT + 5  # 45 seconds total
+                waited = 0
+                check_interval = 1  # Check every 1 second
+                last_dot = 0
+                
+                # Use a more aggressive approach - check interrupt event frequently
+                # Also use shorter check interval for better Ctrl+C responsiveness
+                check_interval = 0.5  # Check every 0.5 seconds
+                
+                while script_thread.is_alive() and waited < timeout_seconds:
+                    # Check interrupt event FIRST before joining
+                    if interrupt_event.is_set():
+                        print("\n[DEBUG] Interrupt detected, breaking wait loop", file=sys.stderr, flush=True)
+                        break
+                        
+                    script_thread.join(timeout=check_interval)
+                    waited += check_interval
+                    
+                    # Check interrupt again after join
+                    if interrupt_event.is_set():
+                        print("\n[DEBUG] Interrupt detected after join", file=sys.stderr, flush=True)
+                        break
+                    
+                    # Show progress dots every 5 seconds
+                    if waited - last_dot >= 5 and script_thread.is_alive():
+                        print(".", end="", flush=True)
+                        last_dot = waited
+                        print(f"[DEBUG] Still waiting... ({waited}s elapsed)", file=sys.stderr, flush=True)
+                
+                # Check results
+                if interrupt_event.is_set() or isinstance(exception[0], KeyboardInterrupt):
+                    print("\n\nInterrupted by user (Ctrl+C). Exiting...")
+                    # Force kill browser process if driver.quit() doesn't work
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    # If driver PID is available, try to kill it
+                    if driver_pid:
+                        try:
+                            os.kill(driver_pid, signal.SIGTERM)
+                            time.sleep(1)
+                            os.kill(driver_pid, signal.SIGKILL)
+                        except:
+                            pass
+                    sys.exit(130)
+                
+                if script_thread.is_alive():
+                    # Thread is STILL running after timeout - this is the hang!
+                    print(" TIMEOUT!")
+                    print(f"\nError: Script execution hung for {waited} seconds.")
+                    print("This is likely due to:")
+                    print("  1. Cloudflare blocking the headless browser")
+                    print("  2. Network issues preventing API calls")
+                    print("  3. Browser/WebDriver malfunction")
+                    
+                    # Try to get browser logs for debugging
+                    try:
+                        print("\n[DEBUG] Attempting to retrieve browser console logs...", file=sys.stderr, flush=True)
+                        logs = driver.get_log('browser')
+                        if logs:
+                            print("[DEBUG] Recent browser console messages:")
+                            for entry in logs[-10:]:  # Last 10 entries
+                                print(f"  [{entry['level']}] {entry['message'][:100]}")
+                    except Exception as log_err:
+                        print(f"[DEBUG] Could not retrieve browser logs: {log_err}", file=sys.stderr, flush=True)
+                    
+                    # Check if session is still valid
+                    try:
+                        if not validate_session(driver):
+                            print("[DEBUG] Session is INVALID - browser crashed or disconnected", file=sys.stderr, flush=True)
+                        else:
+                            print("[DEBUG] Session is still valid - JavaScript execution is stuck", file=sys.stderr, flush=True)
+                    except:
+                        print("[DEBUG] Could not validate session", file=sys.stderr, flush=True)
+                    
+                    # Force quit - try multiple methods
+                    print("\n[DEBUG] Forcefully terminating browser...", file=sys.stderr, flush=True)
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    
+                    # Force kill browser process if driver.quit() doesn't work
+                    if driver_pid:
+                        try:
+                            print(f"[DEBUG] Killing browser process {driver_pid}...", file=sys.stderr, flush=True)
+                            os.kill(driver_pid, signal.SIGTERM)
+                            time.sleep(1)
+                            # If still alive, force kill
+                            try:
+                                os.kill(driver_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass  # Already dead
+                        except Exception as kill_err:
+                            print(f"[DEBUG] Could not kill process: {kill_err}", file=sys.stderr, flush=True)
+                    
+                    time.sleep(2)
+                    
+                    if AUTO_MODE:
+                        print("\nThis may require running manually to establish a fresh session:")
+                        print("  python3 humblesteamkeysredeemer.py")
+                        sys.exit(2)
+                    else:
+                        sys.exit(1)
+                
+                # Clear progress dots if any were shown
+                if waited > 5:
+                    print()
+                
+                # Check for exceptions
+                if exception[0]:
+                    if isinstance(exception[0], (InvalidSessionIdException, NoSuchWindowException)):
+                        print("FAILED")
+                        print("\nError: WebDriver session became invalid during fetch.")
+                        driver.quit()
+                        sys.exit(1)
+                    raise exception[0]
+                
+                order_details = result[0]
+                
+                # Validate result
+                if order_details is None:
+                    print("FAILED")
+                    print("\nError: No data returned from order details fetch")
+                    print("The JavaScript execution completed but returned None")
+                    driver.quit()
+                    sys.exit(1)
+                
+                # Check if JavaScript returned an error object
+                if isinstance(order_details, dict) and 'error' in order_details:
+                    print("FAILED" if waited <= 5 else "")
+                    error_msg = order_details.get('message', 'Unknown error')
+                    error_type = order_details.get('error', '')
+                    print(f"\nError: {error_msg}")
+                    
+                    # User-friendly error messages with helpful guidance
+                    ERROR_HELP = {
+                        'timeout': """
+╔══════════════════════════════════════════════════════════════╗
+║ ⏱️  REQUEST TIMED OUT                                         ║
+╚══════════════════════════════════════════════════════════════╝
 
-    print(
-        f"{len(steam_keys)} Steam keys total -- {len(revealed_keys)} revealed, {len(unrevealed_keys)} unrevealed"
-    )
+Possible causes:
+  • Slow network connection
+  • Humble Bundle servers overloaded
+  • Cloudflare blocking automated requests
 
-    will_reveal_keys = prompt_yes_no("Would you like to redeem on Humble as-yet un-revealed Steam keys?"
-                                " (Revealing keys removes your ability to generate gift links for them)")
-    if will_reveal_keys:
-        try_already_revealed = prompt_yes_no("Would you like to attempt redeeming already-revealed keys as well?")
-        # User has chosen to either redeem all keys or just the 'unrevealed' ones.
-        steam_session = redeem_steam_keys(driver, steam_keys if try_already_revealed else unrevealed_keys, order_details)
-    else:
-        # User has excluded unrevealed keys.
-        steam_session = redeem_steam_keys(driver, revealed_keys, order_details)
-    
-    # Retry errored keys after main redemption
-    retry_errored_keys(driver, steam_session, order_details)
+Try:
+  1. Check your internet connection
+  2. Run in manual mode (without --auto flag)
+  3. Wait a few minutes and try again
+  4. Visit humblebundle.com in your browser to check accessibility
+""",
+                        'auth_error': """
+╔══════════════════════════════════════════════════════════════╗
+║ 🔒 AUTHENTICATION FAILED                                     ║
+╚══════════════════════════════════════════════════════════════╝
 
-    # Cleanup
-    for f in files:
-        files[f].close()
+Your session has expired or is invalid.
+
+To fix:
+  1. Delete cookie files:
+     rm .humblecookies .steamcookies
+  
+  2. Run manual login:
+     python3 humblesteamkeysredeemer.py
+  
+  3. Complete 2FA if prompted
+  
+  4. Restart in auto mode if desired:
+     python3 humblesteamkeysredeemer.py --auto
+""",
+                        'network_error': """
+╔══════════════════════════════════════════════════════════════╗
+║ 🌐 NETWORK ERROR                                             ║
+╚══════════════════════════════════════════════════════════════╝
+
+Could not connect to Humble Bundle.
+
+Possible causes:
+  • Internet connection lost
+  • Cloudflare challenge (run without --auto)
+  • Humble Bundle servers down
+
+Check:
+  • Network connectivity: ping google.com
+  • Humble status: visit humblebundle.com in browser
+  • Try again in 5-10 minutes
+""",
+                        'json_parse_error': """
+╔══════════════════════════════════════════════════════════════╗
+║ 📄 HUMBLE BUNDLE API ERROR (Malformed JSON)                 ║
+╚══════════════════════════════════════════════════════════════╝
+
+Humble Bundle's API returned invalid JSON data.
+
+This is a TEMPORARY Humble Bundle server issue (not your fault).
+
+What this means:
+  • Humble Bundle's servers returned corrupted/malformed data
+  • This usually resolves itself within a few minutes
+  • It's not related to your internet or login
+
+What to do:
+  1. Wait 5-10 minutes and try again
+  2. Check Humble Bundle status: https://status.humblebundle.com/
+  3. If it persists for >1 hour, report to Humble Bundle support
+  
+The error details have been logged for debugging.
+"""
+                    }
+                    
+                    if error_type in ERROR_HELP:
+                        print(ERROR_HELP[error_type])
+                    else:
+                        print(f"\n❌ Error: {error_msg}")
+                    
+                    # Show additional details if available (for json_parse_error)
+                    if error_type == 'json_parse_error' and 'details' in order_details:
+                        print(f"\n[DEBUG] {order_details.get('details', '')}")
+                    
+                    if error_type == 'auth_error':
+                        if AUTO_MODE:
+                            print("Please run the script manually to re-login.")
+                            driver.quit()
+                            sys.exit(2)
+                    elif error_type in ('network_error', 'json_parse_error'):
+                        # These are server/network issues, not auth issues
+                        # In auto mode, we can retry later (don't exit with code 2)
+                        if AUTO_MODE:
+                            print("\nThis is a temporary server issue. The daemon will retry automatically.")
+                            driver.quit()
+                            sys.exit(1)  # Exit code 1 = retryable error
+                    
+                    driver.quit()
+                    sys.exit(1)
+                
+                # Success!
+                print("OK" if waited <= 5 else " OK")
+                
+                # Check if any orders failed (look for warnings in browser console)
+                failed_order_count = 0
+                failed_order_ids = []
+                try:
+                    logs = driver.get_log('browser')
+                    for entry in logs:
+                        if 'WARNING' in entry.get('message', '') and 'Failed to fetch order:' in entry.get('message', ''):
+                            failed_order_count += 1
+                            # Extract order ID from message like "[WARNING] Failed to fetch order: k4ydvFTB8zWUyRZY"
+                            msg = entry['message']
+                            if ' order:' in msg:
+                                order_id = msg.split(' order:')[1].split(' -')[0].strip()
+                                if order_id not in failed_order_ids:
+                                    failed_order_ids.append(order_id)
+                except Exception:
+                    pass  # Couldn't get browser logs, that's okay
+                
+                if isinstance(order_details, list):
+                    total_fetched = len(order_details)
+                    if failed_order_count > 0:
+                        print(f"⚠️  Fetched {total_fetched} orders successfully, {failed_order_count} failed (skipped)")
+                        print(f"    Failed order IDs: {', '.join(failed_order_ids[:5])}")
+                        if len(failed_order_ids) > 5:
+                            print(f"    ... and {len(failed_order_ids) - 5} more")
+                        print(f"    (These orders have corrupted data on Humble's side - not your fault)")
+                        
+                        # Save failed orders to file for debugging (only in non-auto mode)
+                        if not AUTO_MODE:
+                            try:
+                                with open("failed_orders.txt", "w", encoding="utf-8") as f:
+                                    f.write("# Orders that failed to fetch (corrupted data on Humble's side)\n")
+                                    f.write("# These orders are skipped and won't be processed\n\n")
+                                    for order_id in failed_order_ids:
+                                        f.write(f"{order_id}\n")
+                                print(f"    Full list saved to: failed_orders.txt")
+                            except Exception:
+                                pass
+                    else:
+                        print(f"Successfully fetched {total_fetched} orders")
+                else:
+                    print(f"[DEBUG] Successfully fetched {len(order_details) if isinstance(order_details, list) else 'unknown'} orders", file=sys.stderr, flush=True)
+                
+                # Save to cache
+                _save_cache("humble_order_details", order_details)
+                print(f"[DEBUG] Cached order details for future use", file=sys.stderr, flush=True)
+            except KeyboardInterrupt:
+                raise  # Let outer handler deal with it
+            except TimeoutException:
+                print("FAILED")
+                print("\nError: Selenium TimeoutException while fetching order details.")
+                print("The browser's script timeout was exceeded.")
+                driver.quit()
+                sys.exit(1)
+            except Exception as e:
+                print("FAILED")
+                print(f"\nError fetching order details: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                driver.quit()
+                sys.exit(1)
+
+        desired_mode = prompt_mode(order_details,driver)
+        if(desired_mode == "2"):
+            export_mode(driver,order_details)
+            driver.quit()
+            sys.exit(0)
+        if(desired_mode == "3"):
+            humble_chooser_mode(driver,order_details)
+            driver.quit()
+            sys.exit(0)
+
+        # Auto-Redeem mode
+        cls()
+        unrevealed_keys = []
+        revealed_keys = []
+        steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
+        total_steam_keys = len(steam_keys)
+
+        # Load keys that should be excluded (already processed successfully)
+        exclude_filters = ["already_owned.csv", "redeemed.csv", "expired.csv"]
+        original_length = len(steam_keys)
+        for filter_file in exclude_filters:
+            try:
+                with open(filter_file, "r", encoding="utf-8-sig") as f:
+                    keycols = f.read()
+                filtered_keys = [keycol.strip() for keycol in keycols.replace("\n", ",").split(",")]
+                steam_keys = [key for key in steam_keys if key.get("redeemed_key_val",False) not in filtered_keys]
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"Warning: Error reading {filter_file}: {e}")
+        
+        # Load problematic keys (from errored.csv) - these will be tried LAST
+        problematic_keys = []
+        problematic_gamekeys = set()  # Track by gamekey (not redeemed_key_val, which may not exist yet)
+        errored_file = "errored.csv"
+        if os.path.exists(errored_file):
+            try:
+                with open(errored_file, "r", encoding="utf-8-sig") as f:
+                    reader = csv.reader(f)
+                    # Skip header if present
+                    first_row = next(reader, None)
+                    if first_row and first_row[0].lower() != "gamekey":
+                        # First row is data, not header
+                        if len(first_row) >= 1:
+                            problematic_gamekeys.add(first_row[0].strip())
+                    # Read remaining rows
+                    for row in reader:
+                        if len(row) >= 1:
+                            problematic_gamekeys.add(row[0].strip())
+            except Exception as e:
+                print(f"Warning: Error reading {errored_file}: {e}")
+        
+        # Separate keys into normal and problematic (match by gamekey)
+        normal_keys = []
+        for key in steam_keys:
+            gamekey = key.get("gamekey", "")
+            if gamekey and gamekey in problematic_gamekeys:
+                problematic_keys.append(key)
+            else:
+                normal_keys.append(key)
+        
+        # Use normal keys for main processing, problematic keys will be retried at the end
+        steam_keys = normal_keys
+        filtered_count = original_length - len(steam_keys) - len(problematic_keys)
+        unredeemed_count = len(steam_keys)
+        if filtered_count > 0 or len(problematic_keys) > 0:
+            msg = f"Found {total_steam_keys} Steam keys, {filtered_count} already processed"
+            if len(problematic_keys) > 0:
+                msg += f", {len(problematic_keys)} problematic (will retry last)"
+            msg += f", {unredeemed_count} unredeemed"
+            print(msg)
+        else:
+            print(f"Found {total_steam_keys} Steam keys, {unredeemed_count} unredeemed")
+
+        for key in steam_keys:
+            if "redeemed_key_val" in key:
+                revealed_keys.append(key)
+            else:
+                # Has not been revealed via Humble yet
+                unrevealed_keys.append(key)
+
+        print(
+            f"{len(steam_keys)} Steam keys total -- {len(revealed_keys)} revealed, {len(unrevealed_keys)} unrevealed"
+        )
+
+        will_reveal_keys = prompt_yes_no("Would you like to redeem on Humble as-yet un-revealed Steam keys?"
+                                    " (Revealing keys removes your ability to generate gift links for them)")
+        if will_reveal_keys:
+            try_already_revealed = prompt_yes_no("Would you like to attempt redeeming already-revealed keys as well?")
+            # User has chosen to either redeem all keys or just the 'unrevealed' ones.
+            steam_session = redeem_steam_keys(driver, steam_keys if try_already_revealed else unrevealed_keys, order_details)
+        else:
+            # User has excluded unrevealed keys.
+            steam_session = redeem_steam_keys(driver, revealed_keys, order_details)
+        # Retry problematic keys after main redemption (these were marked as problematic on previous runs)
+        # These keys already have redeemed_key_val from errored.csv, so we can retry them directly
+        if problematic_keys:
+            print(f"\n{'='*60}")
+            print(f"Retrying {len(problematic_keys)} previously problematic keys (trying last)...")
+            print(f"{'='*60}\n")
+            # Load the redeemed_key_val from errored.csv for these keys
+            errored_dict = {}
+            if os.path.exists("errored.csv"):
+                try:
+                    with open("errored.csv", "r", encoding="utf-8-sig") as f:
+                        reader = csv.reader(f)
+                        first_row = next(reader, None)
+                        if first_row and first_row[0].lower() != "gamekey":
+                            if len(first_row) >= 3:
+                                errored_dict[first_row[0].strip()] = first_row[2].strip()
+                        for row in reader:
+                            if len(row) >= 3:
+                                errored_dict[row[0].strip()] = row[2].strip()
+                except Exception as e:
+                    print(f"Warning: Error reading errored.csv: {e}")
+            
+            # Update problematic keys with their redeemed_key_val from errored.csv
+            keys_to_retry = []
+            for key in problematic_keys:
+                gamekey = key.get("gamekey", "")
+                if gamekey in errored_dict:
+                    key["redeemed_key_val"] = errored_dict[gamekey]
+                    # Only retry if we have a valid Steam key
+                    if valid_steam_key(key["redeemed_key_val"]):
+                        keys_to_retry.append(key)
+            
+            if keys_to_retry:
+                # Retry these keys directly (they already have redeemed_key_val)
+                total_retry = len(keys_to_retry)
+                for idx, key in enumerate(keys_to_retry, 1):
+                    remaining = total_retry - idx + 1
+                    print(f"[RETRY {idx}/{total_retry}] {key['human_name']} ({remaining} remaining)")
+                    code = _redeem_steam(steam_session, key["redeemed_key_val"])
+                    retry_interval = 300  # 5 minutes between retries
+                    seconds_waited = 0
+                    while code == 53:
+                        minutes_waited = seconds_waited // 60
+                        next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
+                        print(
+                            f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
+                            end="\r",
+                        )
+                        time.sleep(10)
+                        seconds_waited += 10
+                        if seconds_waited % retry_interval == 0:
+                            print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
+                            code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
+                            if code == 53:
+                                print("Still rate limited.")
+                    if code != 53:
+                        print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
+                    write_key(code, key)
+            else:
+                print("No valid keys found to retry from problematic keys list.")
+        
+        # Also retry any keys that errored during THIS run
+        retry_errored_keys(driver, steam_session, order_details)
+
+        # Cleanup (files are automatically closed via context managers)
+        if driver:
+            driver.quit()
+        print("\n" + "="*60)
+        print("Script completed successfully!")
+        print(f"Ended at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*60)
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user (Ctrl+C). Exiting...")
+        try:
+            if driver:
+                driver.quit()
+        except:
+            pass
+        # Files are automatically closed via context managers
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n\nUnexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            if driver:
+                driver.quit()
+        except:
+            pass
+        # Files are automatically closed via context managers
+        sys.exit(1)
+    finally:
+        # Files are automatically closed via context managers
+        pass
