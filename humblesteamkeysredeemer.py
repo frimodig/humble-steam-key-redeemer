@@ -736,10 +736,9 @@ def _redeem_steam(session, key, quiet=False):
         if not quiet:
             print(
                 "Steam responded with 403 Forbidden while redeeming. "
-                "This is likely session/cookie related. Please delete .steamcookies and try again; "
-                "if it persists, wait an hour and retry."
+                "This is likely rate limiting - Steam limits ~50 keys per hour."
             )
-        return 53
+        return 53  # Return rate limit error code
     try:
         blob = r.json()
     except ValueError:
