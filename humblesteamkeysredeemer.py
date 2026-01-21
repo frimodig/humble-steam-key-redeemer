@@ -238,15 +238,15 @@ def detect_browsers():
     return detected
 
 
-def try_chromium_browser(name, binary_path, exceptions):
-    """Try to create a Chromium-based browser driver (visible, not headless for Cloudflare)."""
+def try_chromium_browser(name, binary_path, exceptions, headless=True):
+    """Try to create a Chromium-based browser driver."""
     driver = None
 
     if HAS_WEBDRIVER_MANAGER:
         try:
             options = webdriver.ChromeOptions()
-            # VISIBLE browser - Cloudflare blocks headless
-            # options.add_argument("--headless=new")
+            if headless:
+                options.add_argument("--headless=new")
             options.add_argument("--disable-blink-features=AutomationControlled")
             if binary_path:
                 options.binary_location = binary_path
@@ -269,8 +269,8 @@ def try_chromium_browser(name, binary_path, exceptions):
     # Fallback without webdriver-manager
     try:
         options = webdriver.ChromeOptions()
-        # VISIBLE browser - Cloudflare blocks headless
-        # options.add_argument("--headless=new")
+        if headless:
+            options.add_argument("--headless=new")
         options.add_argument("--disable-blink-features=AutomationControlled")
         if binary_path:
             options.binary_location = binary_path
@@ -283,15 +283,15 @@ def try_chromium_browser(name, binary_path, exceptions):
     return None
 
 
-def try_firefox_browser(name, binary_path, exceptions):
-    """Try to create a Firefox browser driver (visible, not headless for Cloudflare)."""
+def try_firefox_browser(name, binary_path, exceptions, headless=True):
+    """Try to create a Firefox browser driver."""
     driver = None
     
     if HAS_WEBDRIVER_MANAGER:
         try:
             options = webdriver.FirefoxOptions()
-            # VISIBLE browser - Cloudflare blocks headless
-            # options.add_argument("-headless")
+            if headless:
+                options.add_argument("-headless")
             if binary_path:
                 options.binary_location = binary_path
             service = FirefoxService(GeckoDriverManager().install())
@@ -304,8 +304,8 @@ def try_firefox_browser(name, binary_path, exceptions):
     # Fallback without webdriver-manager
     try:
         options = webdriver.FirefoxOptions()
-        # VISIBLE browser - Cloudflare blocks headless
-        # options.add_argument("-headless")
+        if headless:
+            options.add_argument("-headless")
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Firefox(options=options)
@@ -317,8 +317,8 @@ def try_firefox_browser(name, binary_path, exceptions):
     return None
 
 
-def get_headless_driver():
-    """Get a headless browser driver, auto-detecting available browsers."""
+def get_browser_driver(headless=True):
+    """Get a browser driver, auto-detecting available browsers."""
     exceptions = []
     
     # Detect installed browsers
@@ -330,22 +330,23 @@ def get_headless_driver():
     # Try each detected browser
     for name, browser_type, binary_path in detected_browsers:
         if browser_type == "chromium":
-            driver = try_chromium_browser(name, binary_path, exceptions)
+            driver = try_chromium_browser(name, binary_path, exceptions, headless)
         else:  # firefox
-            driver = try_firefox_browser(name, binary_path, exceptions)
+            driver = try_firefox_browser(name, binary_path, exceptions, headless)
         
         if driver:
-            print(f"Using {name} browser")
+            mode = "headless" if headless else "visible"
+            print(f"Using {name} browser ({mode})")
             return driver
     
     # No detected browsers worked, try generic fallback (driver in PATH)
     print("No browsers detected, trying generic fallback...")
     
-    driver = try_chromium_browser("Chrome (generic)", None, exceptions)
+    driver = try_chromium_browser("Chrome (generic)", None, exceptions, headless)
     if driver:
         return driver
     
-    driver = try_firefox_browser("Firefox (generic)", None, exceptions)
+    driver = try_firefox_browser("Firefox (generic)", None, exceptions, headless)
     if driver:
         return driver
     
@@ -472,15 +473,31 @@ def do_login(driver,payload):
             sys.exit()
         return auth,login_json
 
-def humble_login(driver):
+def humble_login(driver, is_headless=True):
+    """Login to Humble. Returns (driver, success) - driver may be different if we switched to visible mode."""
     global AUTO_MODE
     cls()
+    
+    # First check if we have saved cookies - go to main site to load them
+    cookie_file = ".humblecookies"
+    if os.path.exists(cookie_file):
+        driver.get("https://www.humblebundle.com/")
+        time.sleep(1)
+        if try_recover_cookies(cookie_file, driver) and verify_logins_session(driver)[0]:
+            print("Using saved Humble session.")
+            return driver, True
+        print("Saved session expired, need to log in again.")
+    
+    # Need interactive login - if we're headless, switch to visible browser
+    if is_headless:
+        print("Switching to visible browser for login...")
+        driver.quit()
+        driver = get_browser_driver(headless=False)
+        set_humble_driver(driver)
+    
+    # Go to login page
     driver.get(HUMBLE_LOGIN_PAGE)
     time.sleep(2)  # Let page fully load
-    
-    # Attempt to use saved session
-    if try_recover_cookies(".humblecookies", driver) and verify_logins_session(driver)[0]:
-        return True
 
     # Saved session doesn't work - need interactive login
     if AUTO_MODE:
@@ -517,7 +534,7 @@ def humble_login(driver):
         except Exception as e:
             print(f"[DEBUG] Auto-login failed: {e}")
             print("Falling back to manual login...")
-            return humble_login_manual(driver)
+            return humble_login_manual(driver), True
 
         if "errors" in login_json and "username" in login_json["errors"]:
             # Unknown email OR mismatched password
@@ -560,14 +577,14 @@ def humble_login(driver):
             except Exception as e:
                 print(f"[DEBUG] 2FA submission failed: {e}")
                 print("Falling back to manual login...")
-                return humble_login_manual(driver)
+                return humble_login_manual(driver), True
 
         export_cookies(".humblecookies", driver)
-        return True
+        return driver, True
 
 
 def humble_login_manual(driver):
-    """Manual login fallback when API is blocked by Cloudflare."""
+    """Manual login fallback when API is blocked by Cloudflare. Returns the driver."""
     global AUTO_MODE
     
     if AUTO_MODE:
@@ -604,7 +621,7 @@ def humble_login_manual(driver):
         return humble_login_manual(driver)  # Retry
     
     export_cookies(".humblecookies", driver)
-    return True
+    return driver
 
 
 def steam_login():
@@ -1413,9 +1430,11 @@ if __name__=="__main__":
         print("RUNNING IN AUTO MODE")
         print("="*50)
     
-    # Create a consistent session for Humble API use
-    driver = get_headless_driver()
-    humble_login(driver)
+    # Create browser - start headless if we have cookies, visible otherwise
+    cookie_file = ".humblecookies"
+    start_headless = os.path.exists(cookie_file)
+    driver = get_browser_driver(headless=start_headless)
+    driver, _ = humble_login(driver, is_headless=start_headless)
     print("Successfully signed in on Humble.")
 
     print(f"Getting order details, please wait")
