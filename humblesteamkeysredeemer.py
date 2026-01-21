@@ -488,14 +488,7 @@ def humble_login(driver, is_headless=True):
             return driver, True
         print("Saved session expired, need to log in again.")
     
-    # Need interactive login - if we're headless, switch to visible browser
-    if is_headless:
-        print("Switching to visible browser for login...")
-        driver.quit()
-        driver = get_browser_driver(headless=False)
-        set_humble_driver(driver)
-    
-    # Go to login page
+    # Go to login page (still headless - try API login first)
     driver.get(HUMBLE_LOGIN_PAGE)
     time.sleep(2)  # Let page fully load
 
@@ -514,7 +507,7 @@ def humble_login(driver, is_headless=True):
         print("="*60)
         sys.exit(2)  # Exit code 2 = stale cookies
 
-    # Try automatic login first, fall back to manual if it fails
+    # Try automatic API login first (works in headless if Cloudflare allows)
     authorized = False
     while not authorized:
         username = input("Humble Email: ")
@@ -533,7 +526,12 @@ def humble_login(driver, is_headless=True):
             auth, login_json = do_login(driver, payload)
         except Exception as e:
             print(f"[DEBUG] Auto-login failed: {e}")
-            print("Falling back to manual login...")
+            # Only switch to visible browser if we're currently headless
+            if is_headless:
+                print("Switching to visible browser for manual login...")
+                driver.quit()
+                driver = get_browser_driver(headless=False)
+                set_humble_driver(driver)
             return humble_login_manual(driver), True
 
         if "errors" in login_json and "username" in login_json["errors"]:
@@ -576,7 +574,12 @@ def humble_login(driver, is_headless=True):
                     break
             except Exception as e:
                 print(f"[DEBUG] 2FA submission failed: {e}")
-                print("Falling back to manual login...")
+                # Only switch to visible browser if we're currently headless
+                if is_headless:
+                    print("Switching to visible browser for manual login...")
+                    driver.quit()
+                    driver = get_browser_driver(headless=False)
+                    set_humble_driver(driver)
                 return humble_login_manual(driver), True
 
         export_cookies(".humblecookies", driver)
@@ -1430,11 +1433,9 @@ if __name__=="__main__":
         print("RUNNING IN AUTO MODE")
         print("="*50)
     
-    # Create browser - start headless if we have cookies, visible otherwise
-    cookie_file = ".humblecookies"
-    start_headless = os.path.exists(cookie_file)
-    driver = get_browser_driver(headless=start_headless)
-    driver, _ = humble_login(driver, is_headless=start_headless)
+    # Always start headless - only switch to visible if manual login is needed
+    driver = get_browser_driver(headless=True)
+    driver, _ = humble_login(driver, is_headless=True)
     print("Successfully signed in on Humble.")
 
     print(f"Getting order details, please wait")
