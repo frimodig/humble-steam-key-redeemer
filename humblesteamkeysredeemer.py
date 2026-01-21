@@ -1413,11 +1413,14 @@ def humble_chooser_mode(humble_session,order_details):
             redeem_steam_keys(humble_session,chosen_keys)
 
 def cls():
-    os.system('cls' if os.name=='nt' else 'clear')
+    # Don't clear screen in auto mode - we want to preserve the log
+    if not AUTO_MODE:
+        os.system('cls' if os.name=='nt' else 'clear')
     print_main_header()
 
 def print_main_header():
-    print("-=FailSpy's Humble Bundle Helper!=-")
+    if not AUTO_MODE:
+        print("-=FailSpy's Humble Bundle Helper!=-")
     print("--------------------------------------")
     
 if __name__=="__main__":
@@ -1431,16 +1434,20 @@ if __name__=="__main__":
         AUTO_MODE = True
         print("="*50)
         print("RUNNING IN AUTO MODE")
+        print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*50)
     
     # Always start headless - only switch to visible if manual login is needed
+    print("Starting browser...", end=" ", flush=True)
     driver = get_browser_driver(headless=True)
+    print("Logging in to Humble...", end=" ", flush=True)
     driver, _ = humble_login(driver, is_headless=True)
-    print("Successfully signed in on Humble.")
+    print("OK")
 
-    print(f"Getting order details, please wait")
+    print("Fetching order details...", end=" ", flush=True)
 
     order_details = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
+    print("OK")
 
     desired_mode = prompt_mode(order_details,driver)
     if(desired_mode == "2"):
@@ -1455,6 +1462,7 @@ if __name__=="__main__":
     unrevealed_keys = []
     revealed_keys = []
     steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
+    total_steam_keys = len(steam_keys)
 
     filters = ["errored.csv", "already_owned.csv", "redeemed.csv", "expired.csv"]
     original_length = len(steam_keys)
@@ -1466,8 +1474,9 @@ if __name__=="__main__":
             steam_keys = [key for key in steam_keys if key.get("redeemed_key_val",False) not in filtered_keys]
         except FileNotFoundError:
             pass
-    if len(steam_keys) != original_length:
-        print("Filtered {} keys from previous runs".format(original_length - len(steam_keys)))
+    filtered_count = original_length - len(steam_keys)
+    if filtered_count > 0:
+        print(f"Found {total_steam_keys} Steam keys, {filtered_count} already processed, {len(steam_keys)} remaining")
 
     for key in steam_keys:
         if "redeemed_key_val" in key:
