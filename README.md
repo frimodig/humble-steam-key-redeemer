@@ -1,5 +1,8 @@
 # Humble Steam Key Redeemer
 
+> **Fork of [FailSpy/humble-steam-key-redeemer](https://github.com/FailSpy/humble-steam-key-redeemer)**  
+> Original work by [FailSpy](https://github.com/FailSpy). This fork adds daemon mode, auto-browser detection, and reliability improvements.
+
 Python utility script to extract Humble keys, and redeem them on Steam automagically by detecting when a game is already owned on Steam.
 
 This is primarily designed to be a set-it-and-forget-it tool that maximizes successful entry of keys into Steam, assuring that no Steam game goes unredeemed.
@@ -137,3 +140,13 @@ python3 humblesteamkeysredeemer.py
 # 5. Check progress
 ./run_daemon.sh --stats
 ```
+
+---
+
+## Credits & License
+
+- **Original Project**: [FailSpy/humble-steam-key-redeemer](https://github.com/FailSpy/humble-steam-key-redeemer) by [FailSpy](https://github.com/FailSpy)
+- **Steam API Improvements**: Based on [PR #55](https://github.com/FailSpy/humble-steam-key-redeemer/pull/55) by [DIASILEDU](https://github.com/DIASILEDU)
+- **Fork Enhancements**: Daemon mode, browser detection, reliability improvements by [frimodig](https://github.com/frimodig)
+
+The original project does not specify a license. This fork's additions (daemon mode, browser detection, etc.) are provided as-is for personal use. Please respect the original author's work.
