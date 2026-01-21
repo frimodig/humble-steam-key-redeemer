@@ -18,6 +18,10 @@ from concurrent.futures import ThreadPoolExecutor
 import atexit
 import signal
 from http.client import responses
+import argparse
+
+# Auto mode flag - when True, auto-answers prompts for daemon/unattended operation
+AUTO_MODE = False
 
 try:
     from webdriver_manager.chrome import ChromeDriverManager
@@ -143,11 +147,21 @@ def perform_post(driver,url,payload):
 
 def process_quit(driver):
     def quit_on_exit(*args):
-        driver.quit()
+        try:
+            driver.quit()
+        except:
+            pass
+        sys.exit(0)
+    
+    def quit_on_exit_atexit():
+        try:
+            driver.quit()
+        except:
+            pass
 
-    atexit.register(quit_on_exit)
-    signal.signal(signal.SIGTERM,quit_on_exit)
-    signal.signal(signal.SIGINT,quit_on_exit)
+    atexit.register(quit_on_exit_atexit)
+    signal.signal(signal.SIGTERM, quit_on_exit)
+    signal.signal(signal.SIGINT, quit_on_exit)
 
 # Browser detection configuration
 # Each entry: (name, type, paths) where type is 'chromium' or 'firefox'
@@ -225,13 +239,15 @@ def detect_browsers():
 
 
 def try_chromium_browser(name, binary_path, exceptions):
-    """Try to create a headless Chromium-based browser driver."""
+    """Try to create a Chromium-based browser driver (visible, not headless for Cloudflare)."""
     driver = None
-    
+
     if HAS_WEBDRIVER_MANAGER:
         try:
             options = webdriver.ChromeOptions()
-            options.add_argument("--headless=new")
+            # VISIBLE browser - Cloudflare blocks headless
+            # options.add_argument("--headless=new")
+            options.add_argument("--disable-blink-features=AutomationControlled")
             if binary_path:
                 options.binary_location = binary_path
             
@@ -253,7 +269,9 @@ def try_chromium_browser(name, binary_path, exceptions):
     # Fallback without webdriver-manager
     try:
         options = webdriver.ChromeOptions()
-        options.add_argument("--headless=new")
+        # VISIBLE browser - Cloudflare blocks headless
+        # options.add_argument("--headless=new")
+        options.add_argument("--disable-blink-features=AutomationControlled")
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Chrome(options=options)
@@ -266,13 +284,14 @@ def try_chromium_browser(name, binary_path, exceptions):
 
 
 def try_firefox_browser(name, binary_path, exceptions):
-    """Try to create a headless Firefox browser driver."""
+    """Try to create a Firefox browser driver (visible, not headless for Cloudflare)."""
     driver = None
     
     if HAS_WEBDRIVER_MANAGER:
         try:
             options = webdriver.FirefoxOptions()
-            options.add_argument("-headless")
+            # VISIBLE browser - Cloudflare blocks headless
+            # options.add_argument("-headless")
             if binary_path:
                 options.binary_location = binary_path
             service = FirefoxService(GeckoDriverManager().install())
@@ -285,7 +304,8 @@ def try_firefox_browser(name, binary_path, exceptions):
     # Fallback without webdriver-manager
     try:
         options = webdriver.FirefoxOptions()
-        options.add_argument("-headless")
+        # VISIBLE browser - Cloudflare blocks headless
+        # options.add_argument("-headless")
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Firefox(options=options)
@@ -361,7 +381,7 @@ def get_headless_driver():
         for browser, exception in exceptions:
             error_msg = str(exception) if not hasattr(exception, 'msg') else exception.msg
             print(f"  {browser} {error_msg[:100]}")
-    
+
     time.sleep(30)
     sys.exit()
 
@@ -373,6 +393,12 @@ Which key export mode would you like to use?
 [3] Humble Choice chooser
 """
 def prompt_mode(order_details,humble_session):
+    global AUTO_MODE
+    if AUTO_MODE:
+        print(MODE_PROMPT)
+        print("Choose 1, 2, or 3: 1 (auto-mode)")
+        return "1"
+    
     mode = None
     while mode not in ["1","2","3"]:
         print(MODE_PROMPT)
@@ -447,18 +473,35 @@ def do_login(driver,payload):
         return auth,login_json
 
 def humble_login(driver):
+    global AUTO_MODE
     cls()
     driver.get(HUMBLE_LOGIN_PAGE)
+    time.sleep(2)  # Let page fully load
+    
     # Attempt to use saved session
     if try_recover_cookies(".humblecookies", driver) and verify_logins_session(driver)[0]:
         return True
 
-    # Saved session didn't work
+    # Saved session doesn't work - need interactive login
+    if AUTO_MODE:
+        print("")
+        print("="*60)
+        print("HUMBLE SESSION EXPIRED")
+        print("="*60)
+        print("The Humble login cookies are stale or missing.")
+        print("")
+        print("To fix this, run the script manually to re-login:")
+        print("  python3 humblesteamkeysredeemer.py")
+        print("")
+        print("Then restart the daemon.")
+        print("="*60)
+        sys.exit(2)  # Exit code 2 = stale cookies
+
+    # Try automatic login first, fall back to manual if it fails
     authorized = False
     while not authorized:
         username = input("Humble Email: ")
         password = pwinput()
-
 
         payload = {
             "access_token": "",
@@ -469,7 +512,12 @@ def humble_login(driver):
             "password": password,
         }
 
-        auth,login_json = do_login(driver,payload)
+        try:
+            auth, login_json = do_login(driver, payload)
+        except Exception as e:
+            print(f"[DEBUG] Auto-login failed: {e}")
+            print("Falling back to manual login...")
+            return humble_login_manual(driver)
 
         if "errors" in login_json and "username" in login_json["errors"]:
             # Unknown email OR mismatched password
@@ -478,43 +526,89 @@ def humble_login(driver):
 
         while "humble_guard_required" in login_json or "two_factor_required" in login_json:
             # There may be differences for Humble's SMS 2FA, haven't tested.
-            if "humble_guard_required" in login_json:
-                humble_guard_code = input("Please enter the Humble security code: ")
-                payload["guard"] = humble_guard_code.upper()
-                # Humble security codes are case-sensitive via API, but luckily it's all uppercase!
-                auth,login_json = do_login(driver,payload)
+            try:
+                if "humble_guard_required" in login_json:
+                    humble_guard_code = input("Please enter the Humble security code (check email): ")
+                    payload["guard"] = humble_guard_code.upper()
+                    # Humble security codes are case-sensitive via API, but luckily it's all uppercase!
+                    auth,login_json = do_login(driver,payload)
 
-                if (
-                    "user_terms_opt_in_data" in login_json
-                    and login_json["user_terms_opt_in_data"]["needs_to_opt_in"]
+                    if (
+                        "user_terms_opt_in_data" in login_json
+                        and login_json["user_terms_opt_in_data"]["needs_to_opt_in"]
+                    ):
+                        # Nope, not messing with this.
+                        print(
+                            "There's been an update to the TOS, please sign in to Humble on your browser."
+                        )
+                        sys.exit()
+                elif (
+                    "two_factor_required" in login_json and
+                    "errors" in login_json
+                    and "authy-input" in login_json["errors"]
                 ):
-                    # Nope, not messing with this.
-                    print(
-                        "There's been an update to the TOS, please sign in to Humble on your browser."
-                    )
-                    sys.exit()
-            elif (
-                "two_factor_required" in login_json and
-                "errors" in login_json
-                and "authy-input" in login_json["errors"]
-            ):
-                code = input("Please enter 2FA code: ")
-                payload["code"] = code
-                auth,login_json = do_login(driver,payload)
-            elif "errors" in login_json:
-                print("Unexpected login error detected.")
-                print(login_json["errors"])
-                raise Exception(login_json)
-                sys.exit()
-            
-            if auth == 200:
-                break
+                    code = input("Please enter 2FA code: ")
+                    payload["code"] = code
+                    auth,login_json = do_login(driver,payload)
+                elif "errors" in login_json:
+                    print("Unexpected login error detected.")
+                    print(login_json["errors"])
+                    raise Exception(login_json)
+                
+                if auth == 200:
+                    break
+            except Exception as e:
+                print(f"[DEBUG] 2FA submission failed: {e}")
+                print("Falling back to manual login...")
+                return humble_login_manual(driver)
 
         export_cookies(".humblecookies", driver)
         return True
 
 
+def humble_login_manual(driver):
+    """Manual login fallback when API is blocked by Cloudflare."""
+    global AUTO_MODE
+    
+    if AUTO_MODE:
+        print("")
+        print("="*60)
+        print("HUMBLE SESSION EXPIRED")
+        print("="*60)
+        print("The Humble login cookies are stale or Cloudflare is blocking.")
+        print("")
+        print("To fix this, run the script manually to re-login:")
+        print("  python3 humblesteamkeysredeemer.py")
+        print("")
+        print("Then restart the daemon.")
+        print("="*60)
+        sys.exit(2)  # Exit code 2 = stale cookies
+    
+    print("\n" + "="*60)
+    print("MANUAL LOGIN REQUIRED")
+    print("="*60)
+    print("A browser window is open to the Humble Bundle login page.")
+    print("Please log in manually (handle any CAPTCHAs or 2FA).")
+    print("Once logged in and you see your library, press Enter here.")
+    print("="*60 + "\n")
+    
+    driver.get(HUMBLE_LOGIN_PAGE)
+    input("Press Enter after you've logged in successfully...")
+    
+    # Verify login worked
+    driver.get("https://www.humblebundle.com/home/library")
+    time.sleep(2)
+    
+    if "login" in driver.current_url.lower():
+        print("Login verification failed - still on login page. Please try again.")
+        return humble_login_manual(driver)  # Retry
+    
+    export_cookies(".humblecookies", driver)
+    return True
+
+
 def steam_login():
+    global AUTO_MODE
     # Sign into Steam web
 
     # Attempt to use saved session
@@ -522,7 +616,22 @@ def steam_login():
     if try_recover_cookies(".steamcookies", r) and verify_logins_session(r)[1]:
         return r
 
-    # Saved state doesn't work, prompt user to sign in.
+    # Saved state doesn't work
+    if AUTO_MODE:
+        print("")
+        print("="*60)
+        print("STEAM SESSION EXPIRED")
+        print("="*60)
+        print("The Steam login cookies are stale or missing.")
+        print("")
+        print("To fix this, run the script manually to re-login:")
+        print("  python3 humblesteamkeysredeemer.py")
+        print("")
+        print("Then restart the daemon.")
+        print("="*60)
+        sys.exit(2)  # Exit code 2 = stale cookies
+    
+    # Prompt user to sign in.
     s_username = input("Steam Username: ")
     user = wa.WebAuth(s_username)
     session = user.cli_login()
@@ -536,10 +645,14 @@ def redeem_humble_key(sess, tpk):
     payload = {"keytype": tpk["machine_name"], "key": tpk["gamekey"], "keyindex": tpk["keyindex"]}
     status,respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
     
-    if status != 200 or "error_msg" in respjson or not respjson["success"]:
+    if status != 200 or "error_msg" in respjson or not respjson.get("success", False):
         print("Error redeeming key on Humble for " + tpk["human_name"])
-        if("error_msg" in respjson):
-            print(respjson["error_msg"])
+        if "error_msg" in respjson:
+            error_msg = respjson["error_msg"]
+            print(error_msg)
+            # Check for expired key
+            if "expired" in error_msg.lower():
+                return "EXPIRED"
         return ""
     try:
         return respjson["key"]
@@ -714,6 +827,8 @@ def write_key(code, key):
     filename = "redeemed.csv"
     if code == 15 or code == 9:
         filename = "already_owned.csv"
+    elif code == "EXPIRED":
+        filename = "expired.csv"
     elif code != 0:
         filename = "errored.csv"
 
@@ -729,6 +844,7 @@ def write_key(code, key):
 
 
 def prompt_skipped(skipped_games):
+    global AUTO_MODE
     user_filtered = []
     with open("skipped.txt", "w", encoding="utf-8-sig") as file:
         for skipped_game in skipped_games.keys():
@@ -738,6 +854,14 @@ def prompt_skipped(skipped_games):
         f"Inside skipped.txt is a list of {len(skipped_games)} games that we think you already own, but aren't "
         f"completely sure "
     )
+    
+    if AUTO_MODE:
+        print("(auto-mode: skipping all uncertain games)")
+        # In auto mode, skip all uncertain games (safer)
+        if os.path.exists("skipped.txt"):
+            os.remove("skipped.txt")
+        return []
+    
     try:
         input(
             "Feel free to REMOVE from that list any games that you would like to try anyways, and when done press "
@@ -758,7 +882,13 @@ def prompt_skipped(skipped_games):
     return user_requested
 
 
-def prompt_yes_no(question):
+def prompt_yes_no(question, default_yes=True):
+    global AUTO_MODE
+    if AUTO_MODE:
+        answer = "y" if default_yes else "n"
+        print(f"{question} [{answer}] (auto-mode)")
+        return default_yes
+    
     ans = None
     answers = ["y","n"]
     while ans not in answers:
@@ -946,6 +1076,11 @@ def match_ownership(owned_app_details, game, filter_live):
     return best_match
 
 def prompt_filter_live():
+    global AUTO_MODE
+    if AUTO_MODE:
+        print("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [n] (auto-mode)")
+        return "n"
+    
     mode = None
     while mode not in ["y","n"]:
         mode = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/n] ").strip()
@@ -1012,6 +1147,12 @@ def redeem_steam_keys(humble_session, humble_keys):
             redeemed_key = redeem_humble_key(humble_session, key)
             key["redeemed_key_val"] = redeemed_key
             # Worth noting this will only persist for this loop -- does not get saved to unownedgames' obj
+
+        # Handle expired keys - skip without retry
+        if key["redeemed_key_val"] == "EXPIRED":
+            print(f"  -> Key expired, skipping")
+            write_key("EXPIRED", key)
+            continue
 
         if not valid_steam_key(key["redeemed_key_val"]):
             # Most likely humble gift link
@@ -1257,6 +1398,18 @@ def print_main_header():
     print("--------------------------------------")
     
 if __name__=="__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Humble Bundle Steam Key Redeemer')
+    parser.add_argument('--auto', action='store_true', 
+                        help='Auto mode: automatically answer prompts (requires existing login cookies)')
+    args = parser.parse_args()
+    
+    if args.auto:
+        AUTO_MODE = True
+        print("="*50)
+        print("RUNNING IN AUTO MODE")
+        print("="*50)
+    
     # Create a consistent session for Humble API use
     driver = get_headless_driver()
     humble_login(driver)
@@ -1280,7 +1433,7 @@ if __name__=="__main__":
     revealed_keys = []
     steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
 
-    filters = ["errored.csv", "already_owned.csv", "redeemed.csv"]
+    filters = ["errored.csv", "already_owned.csv", "redeemed.csv", "expired.csv"]
     original_length = len(steam_keys)
     for filter_file in filters:
         try:
