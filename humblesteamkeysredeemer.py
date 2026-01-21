@@ -12,13 +12,13 @@ import os
 import json
 import sys
 import webbrowser
-import os
 from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor
 import atexit
 import signal
 from http.client import responses
 import argparse
+import csv
 
 # Auto mode flag - when True, auto-answers prompts for daemon/unattended operation
 AUTO_MODE = False
@@ -141,7 +141,6 @@ def perform_post(driver,url,payload):
     csrf = csrf['value'] if csrf is not None else ''
     if csrf is None:
         csrf = ''
-    script = fetch_cmd.format(formData=json_payload,url=url,csrf=csrf)
 
     return driver.execute_async_script(fetch_cmd.format(formData=json_payload,url=url,csrf=csrf))
 
@@ -531,7 +530,6 @@ def humble_login(driver, is_headless=True):
                 print("Switching to visible browser for manual login...")
                 driver.quit()
                 driver = get_browser_driver(headless=False)
-                set_humble_driver(driver)
             return humble_login_manual(driver), True
 
         if "errors" in login_json and "username" in login_json["errors"]:
@@ -579,7 +577,6 @@ def humble_login(driver, is_headless=True):
                     print("Switching to visible browser for manual login...")
                     driver.quit()
                     driver = get_browser_driver(headless=False)
-                    set_humble_driver(driver)
                 return humble_login_manual(driver), True
 
         export_cookies(".humblecookies", driver)
@@ -747,7 +744,12 @@ def _redeem_steam(session, key, quiet=False):
     # Based on https://gist.github.com/snipplets/2156576c2754f8a4c9b43ccb674d5a5d
     if key == "":
         return 0
-    session_id = session.cookies.get_dict()["sessionid"]
+    cookies_dict = session.cookies.get_dict()
+    if "sessionid" not in cookies_dict:
+        if not quiet:
+            print("Error: Steam sessionid cookie missing. Please re-login to Steam.")
+        return 53  # Return error code
+    session_id = cookies_dict["sessionid"]
     r = session.post(
         STEAM_REDEEM_API,
         data={"product_key": key, "sessionid": session_id}
@@ -1111,6 +1113,9 @@ def prompt_filter_live():
 
 def retry_errored_keys(humble_session, steam_session, order_details):
     """Retry keys that previously errored."""
+    if order_details is None:
+        return  # Can't retry without order details
+    
     errored_file = "errored.csv"
     if not os.path.exists(errored_file):
         return
@@ -1119,11 +1124,11 @@ def retry_errored_keys(humble_session, steam_session, order_details):
     errored_keys = []
     try:
         with open(errored_file, "r", encoding="utf-8-sig") as f:
-            lines = f.readlines()
-            for line in lines[1:]:  # Skip header
-                parts = line.strip().split(",")
-                if len(parts) >= 3:
-                    gamekey, human_name, redeemed_key_val = parts[0], parts[1], parts[2]
+            reader = csv.reader(f)
+            next(reader, None)  # Skip header if present
+            for row in reader:
+                if len(row) >= 3:
+                    gamekey, human_name, redeemed_key_val = row[0], row[1], row[2]
                     errored_keys.append({
                         "gamekey": gamekey,
                         "human_name": human_name,
@@ -1408,7 +1413,7 @@ def choose_games(humble_session,choice_month_name,identifier,chosen):
                 "chosen_identifiers[]":display_name,
                 "is_multikey_and_from_choice_modal":"false"
             }
-            status,res = perform_post(driver,HUMBLE_CHOOSE_CONTENT,payload)
+            status,res = perform_post(humble_session,HUMBLE_CHOOSE_CONTENT,payload)
             if not ("success" in res or not res["success"]):
                 print("Error choosing " + choice["title"])
                 print(res)
