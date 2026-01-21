@@ -1159,8 +1159,8 @@ def redeem_steam_keys(humble_session, humble_keys):
             continue
 
         code = _redeem_steam(session, key["redeemed_key_val"])
-        animation = "|/-\\"
-        seconds = 0
+        retry_interval = 300  # 5 minutes between retries (rate limit lasts ~1 hour)
+        seconds_waited = 0
         while code == 53:
             """NOTE
             Steam seems to limit to about 50 keys/hr -- even if all 50 keys are legitimate *sigh*
@@ -1168,16 +1168,20 @@ def redeem_steam_keys(humble_session, humble_keys):
             Duplication counts towards Steam's _failure rate limit_,
             hence why we've worked so hard above to figure out what we already own
             """
-            current_animation = animation[seconds % len(animation)]
+            minutes_waited = seconds_waited // 60
+            next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
             print(
-                f"Waiting for rate limit to go away (takes an hour after first key insert) {current_animation}",
+                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr)   ",
                 end="\r",
             )
-            time.sleep(1)
-            seconds = seconds + 1
-            if seconds % 60 == 0:
-                # Try again every 60 seconds
+            time.sleep(10)
+            seconds_waited += 10
+            if seconds_waited % retry_interval == 0:
+                # Try again every 5 minutes
+                print(f"\nRetrying after {seconds_waited // 60} minutes...")
                 code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
+                if code == 53:
+                    print("Still rate limited.")
 
         write_key(code, key)
 
