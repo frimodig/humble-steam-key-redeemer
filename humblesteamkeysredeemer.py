@@ -1703,11 +1703,19 @@ def prompt_yes_no(question, default_yes=True):
         print(f"{question} [{answer}] (auto-mode)")
         return default_yes
     ans = None
+    default_char = "Y" if default_yes else "N"
     answers = ["y","n"]
     while ans not in answers:
-        prompt = f"{question} [{'/'.join(answers)}] "
+        prompt = f"{question} [{default_char.lower()}/{answers[1 if default_yes else 0]}] "
+        if default_yes:
+            prompt = f"{question} [Y/n] "
+        else:
+            prompt = f"{question} [y/N] "
 
         ans = input(prompt).strip().lower()
+        # Empty input means use default
+        if ans == "":
+            return default_yes
         if ans not in answers:
             print(f"{ans} is not a valid answer")
             continue
@@ -1987,7 +1995,7 @@ def match_ownership(owned_app_details, game, filter_live):
         print(f"Steam games you own that might match '{game['human_name']}':")
         for match in refined_matches:
             print(f"     {owned_app_details[match[1]]}: {match[0]}")
-        if prompt_yes_no(f"Is \"{game['human_name']}\" in the above list?"):
+        if prompt_yes_no(f"Is \"{game['human_name']}\" in the above list?", default_yes=False):
             return refined_matches[0]
         else:
             return (0,None)
@@ -2389,18 +2397,18 @@ def export_mode(humble_session,order_details):
 
     keys = []
     print("Please configure your export:")
-    export_steam_only = prompt_yes_no("Export only Steam keys?")
-    export_revealed = prompt_yes_no("Export revealed keys?")
-    export_unrevealed = prompt_yes_no("Export unrevealed keys?")
+    export_steam_only = prompt_yes_no("Export only Steam keys?", default_yes=False)
+    export_revealed = prompt_yes_no("Export revealed keys?", default_yes=True)
+    export_unrevealed = prompt_yes_no("Export unrevealed keys?", default_yes=True)
     if(not export_revealed and not export_unrevealed):
         print("That leaves 0 keys...")
         sys.exit(1)
     if(export_unrevealed):
-        reveal_unrevealed = prompt_yes_no("Reveal all unrevealed keys? (This will remove your ability to claim gift links on these)")
+        reveal_unrevealed = prompt_yes_no("Reveal all unrevealed keys? (This will remove your ability to claim gift links on these)", default_yes=False)
         if(reveal_unrevealed):
             extra = "Steam " if export_steam_only else ""
-            confirm_reveal = prompt_yes_no(f"Please CONFIRM that you would like ALL {extra}keys on Humble to be revealed, this can't be undone.")
-    steam_config = prompt_yes_no("Would you like to sign into Steam to detect ownership on the export data?")
+            confirm_reveal = prompt_yes_no(f"Please CONFIRM that you would like ALL {extra}keys on Humble to be revealed, this can't be undone.", default_yes=False)
+    steam_config = prompt_yes_no("Would you like to sign into Steam to detect ownership on the export data?", default_yes=True)
     if(steam_config):
         steam_session = steam_login()
         if(verify_logins_session(steam_session)[1]):
@@ -2475,7 +2483,7 @@ def humble_chooser_mode(humble_session,order_details):
     for month in months:
         redeem_all = None
         if(first):
-            redeem_keys = prompt_yes_no("Would you like to auto-redeem these keys after? (Will require Steam login)")
+            redeem_keys = prompt_yes_no("Would you like to auto-redeem these keys after? (Will require Steam login)", default_yes=False)
             first = False
         ready = False
         while not ready:
@@ -2502,7 +2510,7 @@ def humble_chooser_mode(humble_session,order_details):
                     exception = " (Must be redeemed through Humble directly)"
                 print(f"{idx+1}. {title}{rating_text}{exception}")
             if(redeem_all == None and remaining == len(choices)):
-                redeem_all = prompt_yes_no("Would you like to redeem all?")
+                redeem_all = prompt_yes_no("Would you like to redeem all?", default_yes=False)
             else:
                 redeem_all = False
             if(redeem_all):
@@ -2553,7 +2561,7 @@ def humble_chooser_mode(humble_session,order_details):
                         print("\nGames selected:")
                         for choice in chosen:
                             print(choice.get("title", "Unknown"))
-                        confirmed = prompt_yes_no("Please type 'y' to confirm your selection")
+                        confirmed = prompt_yes_no("Please type 'y' to confirm your selection", default_yes=False)
                         if confirmed:
                             choice_month_name = month.get("product", {}).get("choice_url", "")
                             identifier = month.get("parent_identifier", "")
@@ -3136,9 +3144,9 @@ The error details have been logged for debugging.
         )
 
         will_reveal_keys = prompt_yes_no("Would you like to redeem on Humble as-yet un-revealed Steam keys?"
-                                    " (Revealing keys removes your ability to generate gift links for them)")
+                                    " (Revealing keys removes your ability to generate gift links for them)", default_yes=True)
         if will_reveal_keys:
-            try_already_revealed = prompt_yes_no("Would you like to attempt redeeming already-revealed keys as well?")
+            try_already_revealed = prompt_yes_no("Would you like to attempt redeeming already-revealed keys as well?", default_yes=True)
             # User has chosen to either redeem all keys or just the 'unrevealed' ones.
             steam_session = redeem_steam_keys(driver, steam_keys if try_already_revealed else unrevealed_keys, order_details)
         else:
