@@ -2017,9 +2017,12 @@ def prompt_filter_live():
         return "n"
     mode = None
     while mode not in ["y","n"]:
-        mode = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/n] ").strip().lower()
-        if mode in ["y","n"]:
-            return mode
+        user_input = input("You can either see a list of games we think you already own later in a file, or filter them now. Would you like to see them now? [y/N] ").strip().lower()
+        # Empty input means use default (no)
+        if user_input == "":
+            return "n"
+        if user_input in ["y","n"]:
+            return user_input
         else:
             print("Enter y or n")
     return mode
@@ -2224,7 +2227,13 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         default_yes=True
     )
 
-    noted_keys = [key for key in humble_keys if key.get("steam_app_id") not in owned_app_details.keys()]
+    # IMPORTANT: Don't filter unrevealed keys by Steam ownership - we need to reveal them first!
+    # Unrevealed keys don't have redeemed_key_val yet, so we can't know if they're owned
+    revealed_keys_to_check = [key for key in humble_keys if "redeemed_key_val" in key]
+    unrevealed_keys_to_process = [key for key in humble_keys if "redeemed_key_val" not in key]
+    
+    # Only filter revealed keys by Steam ownership
+    noted_keys = [key for key in revealed_keys_to_check if key.get("steam_app_id") not in owned_app_details.keys()]
     skipped_games = {}
     unownedgames = []
     friend_keys_skipped = []  # Track skipped friend keys
@@ -2234,6 +2243,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
 
     filter_live = prompt_filter_live() == "y"
 
+    # Process revealed keys (check ownership)
     for game in noted_keys:
         # Check if it's a friend/co-op key FIRST
         if skip_friend_keys:
@@ -2248,9 +2258,23 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         else:
             unownedgames.append(game)
 
+    # Process unrevealed keys - check for friend/co-op keys but don't filter by Steam ownership
+    # (we need to reveal them first to know what they are)
+    for game in unrevealed_keys_to_process:
+        # Check if it's a friend/co-op key
+        if skip_friend_keys:
+            is_friend, reason = is_friend_or_coop_key(game)
+            if is_friend:
+                friend_keys_skipped.append((game, reason))
+                continue  # Skip this key entirely
+        # Add to unownedgames - we'll reveal and redeem it
+        unownedgames.append(game)
+    
     print(
-        "Filtered out game keys that you already own on Steam; {} keys unowned.".format(
-            len(unownedgames)
+        "Filtered out game keys that you already own on Steam; {} keys unowned ({} revealed, {} unrevealed).".format(
+            len(unownedgames),
+            len(unownedgames) - len(unrevealed_keys_to_process),
+            len(unrevealed_keys_to_process)
         )
     )
     
