@@ -48,6 +48,48 @@ AUTO_MODE = False
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
+# ============================================================================
+# Configuration Constants
+# ============================================================================
+
+# Timeouts and delays (in seconds)
+SCRIPT_TIMEOUT_SECONDS = 40  # Reduced to give 10s buffer after JS timeout (30s)
+JS_TIMEOUT_SECONDS = 30  # JavaScript execution timeout
+PAGE_LOAD_TIMEOUT_SECONDS = 30  # Page load timeout
+NETWORK_REQUEST_TIMEOUT_SECONDS = 30  # HTTP request timeout
+DEFAULT_SLEEP_SECONDS = 2  # Default sleep between operations
+SHORT_SLEEP_SECONDS = 1  # Short sleep for quick operations
+MEDIUM_SLEEP_SECONDS = 2  # Medium sleep for page loads
+LONG_SLEEP_SECONDS = 3  # Long sleep for complex operations
+VERY_LONG_SLEEP_SECONDS = 30  # Very long sleep (e.g., after rate limit)
+
+# Rate limiting
+RATE_LIMIT_RETRY_INTERVAL_SECONDS = 300  # 5 minutes between retries
+RATE_LIMIT_CHECK_INTERVAL_SECONDS = 10  # Check every 10 seconds
+RATE_LIMIT_APPROXIMATE_DURATION_SECONDS = 3600  # ~1 hour total duration
+STEAM_RATE_LIMIT_KEYS_PER_HOUR = 50  # Steam's approximate rate limit
+
+# Retry logic
+DEFAULT_RETRY_COUNT = 3  # Default number of retries
+DEFAULT_RETRY_DELAY_SECONDS = 2  # Default delay between retries
+MAX_RETRY_ATTEMPTS = 3  # Maximum retry attempts for operations
+
+# Session management
+KEEP_ALIVE_INTERVAL_SECONDS = 300  # 5 minutes between keep-alive checks
+SESSION_VALIDATION_TIMEOUT_SECONDS = 10  # Session validation timeout
+PROGRESS_DOT_INTERVAL_SECONDS = 5  # Progress indicator update interval
+
+# File operations
+CSV_FLUSH_INTERVAL = 1  # Flush CSV after each write
+LOG_ROTATION_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+LOG_ROTATION_BACKUP_COUNT = 3  # Keep 3 backup log files
+
+# Browser detection
+BROWSER_DETECTION_TIMEOUT_SECONDS = 5  # Timeout for browser detection
+
+# Legacy constant for backward compatibility
+SCRIPT_TIMEOUT = SCRIPT_TIMEOUT_SECONDS
+
 try:
     from webdriver_manager.chrome import ChromeDriverManager
     from webdriver_manager.firefox import GeckoDriverManager
@@ -161,7 +203,8 @@ headers = {
 }
 
 # Script execution timeout (seconds)
-SCRIPT_TIMEOUT = 40  # Reduced to give 10s buffer after JS timeout (30s)
+# Legacy constant for backward compatibility (use SCRIPT_TIMEOUT_SECONDS instead)
+SCRIPT_TIMEOUT = SCRIPT_TIMEOUT_SECONDS
 
 
 def retry_on_session_error(max_retries=3, delay=2):
@@ -1817,9 +1860,77 @@ def remove_from_errored_csv(gamekey, human_name):
         print(f"[DEBUG] Failed to remove entry from errored.csv: {e}", file=sys.stderr, flush=True)
 
 
+def wait_for_rate_limit_clear(
+    steam_session,
+    key_val: str,
+    remaining: int,
+    keepalive=None,
+    retry_interval: int = RATE_LIMIT_RETRY_INTERVAL_SECONDS,
+    check_interval: int = RATE_LIMIT_CHECK_INTERVAL_SECONDS
+) -> int:
+    """
+    Handle Steam rate limiting with progress feedback and session keep-alive.
+    
+    Waits for Steam's rate limit to clear (~50 keys/hour) with automatic retries.
+    Displays progress and keeps the Humble session alive during the wait.
+    
+    Args:
+        steam_session: Authenticated Steam session for redemption attempts
+        key_val: Steam key to redeem
+        remaining: Number of keys remaining to process
+        keepalive: Optional SessionKeepAlive instance to keep Humble session alive
+        retry_interval: Seconds between retry attempts (default: 300 = 5 minutes)
+        check_interval: Seconds between status checks (default: 10)
+    
+    Returns:
+        Final redemption status code (53 = still rate limited, other = success/failure)
+    """
+    seconds_waited = 0
+    
+    while True:
+        minutes_waited = seconds_waited // 60
+        next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
+        print(
+            f"Rate limited. Waited {minutes_waited}m, "
+            f"retrying in {next_retry}m (limit clears in ~1hr) - "
+            f"{remaining} keys remaining   ",
+            end="\r",
+            flush=True
+        )
+        
+        time.sleep(check_interval)
+        seconds_waited += check_interval
+        
+        # Keep session alive periodically
+        if keepalive and seconds_waited % 60 == 0:  # Every minute
+            keepalive.check()
+        
+        # Retry after retry_interval
+        if seconds_waited % retry_interval == 0:
+            print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
+            code = _redeem_steam(steam_session, key_val, quiet=True)
+            if code != 53:
+                print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
+                return code
+            print("Still rate limited.")
+    
+    return 53  # Should never reach here
+
+
 @contextmanager
 def get_csv_writer(code):
-    """Context manager for CSV file writing. Ensures files are properly closed."""
+    """
+    Context manager for thread-safe CSV file writing with file locking.
+    
+    Ensures files are properly closed and prevents corruption in concurrent scenarios.
+    Uses fcntl (Unix) or msvcrt (Windows) for file locking.
+    
+    Args:
+        code: Redemption status code (determines target CSV file)
+    
+    Yields:
+        File handle for CSV writing
+    """
     filename = "redeemed.csv"
     if code == 15 or code == 9:
         filename = "already_owned.csv"
@@ -1831,10 +1942,44 @@ def get_csv_writer(code):
     # Check if we need to write header
     file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
     
-    with open(filename, "a", encoding="utf-8-sig") as f:
-        if file_needs_header:
-            f.write("gamekey,human_name,redeemed_key_val\n")
-        yield f
+    # Try to import file locking support
+    try:
+        import fcntl  # Unix
+        has_flock = True
+    except ImportError:
+        try:
+            import msvcrt  # Windows
+            has_flock = True
+        except ImportError:
+            has_flock = False
+    
+    with open(filename, "a", encoding="utf-8-sig", newline='') as f:
+        # Acquire exclusive lock for writing
+        if has_flock:
+            try:
+                if os.name == 'nt':  # Windows
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                else:  # Unix
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (OSError, IOError):
+                # Locking failed, but continue anyway (better than failing completely)
+                pass
+        
+        try:
+            if file_needs_header:
+                f.write("gamekey,human_name,redeemed_key_val\n")
+            yield f
+            f.flush()
+        finally:
+            # Release lock
+            if has_flock:
+                try:
+                    if os.name == 'nt':  # Windows
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:  # Unix
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (OSError, IOError):
+                    pass
 
 
 def write_key(code, key):
