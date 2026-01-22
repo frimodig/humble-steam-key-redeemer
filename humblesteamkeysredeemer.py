@@ -3474,17 +3474,17 @@ The error details have been logged for debugging.
         if prompt_yes_no("Pre-filter friend/co-op keys before processing? (Recommended)", default_yes=True):
             non_friend_keys = []
             for key in steam_keys:
-                is_friend, reason = is_friend_or_coop_key(key)
+                is_friend, reason, confidence = is_friend_or_coop_key(key)
                 if is_friend:
-                    friend_keys_prefiltered.append((key, reason))
+                    friend_keys_prefiltered.append((key, reason, confidence))
                 else:
                     non_friend_keys.append(key)
             
             if friend_keys_prefiltered:
                 print(f"Pre-filtered {len(friend_keys_prefiltered)} friend/co-op keys")
                 # Save them to friend_keys.csv
-                for key, reason in friend_keys_prefiltered:
-                    save_friend_key(key, reason)
+                for key, reason, confidence in friend_keys_prefiltered:
+                    save_friend_key(key, reason, confidence)
             
             steam_keys = non_friend_keys
 
