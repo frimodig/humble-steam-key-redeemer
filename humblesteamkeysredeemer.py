@@ -74,6 +74,7 @@ DEFAULT_SLEEP_SECONDS = 2  # Default sleep between operations
 SHORT_SLEEP_SECONDS = 1  # Short sleep for quick operations
 MEDIUM_SLEEP_SECONDS = 2  # Medium sleep for page loads
 LONG_SLEEP_SECONDS = 3  # Long sleep for complex operations
+EXTENDED_SLEEP_SECONDS = 5  # Extended sleep for retries and longer waits
 VERY_LONG_SLEEP_SECONDS = 30  # Very long sleep (e.g., after rate limit)
 
 # Rate limiting
