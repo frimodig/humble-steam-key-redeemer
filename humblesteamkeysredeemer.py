@@ -2527,24 +2527,16 @@ def retry_errored_keys(humble_session, steam_session, order_details):
             print(f"  -> Invalid key format, skipping")
             continue
         code = _redeem_steam(steam_session, key["redeemed_key_val"])
-        retry_interval = 300  # 5 minutes between retries
-        seconds_waited = 0
-        while code == 53:
-            minutes_waited = seconds_waited // 60
-            next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
-            print(
-                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
-                end="\r",
+        if code == 53:
+            # Use reusable rate limit handler
+            code = wait_for_rate_limit_clear(
+                steam_session,
+                key["redeemed_key_val"],
+                remaining,
+                keepalive=None,  # No keepalive in retry context
+                retry_interval=RATE_LIMIT_RETRY_INTERVAL_SECONDS,
+                check_interval=RATE_LIMIT_CHECK_INTERVAL_SECONDS
             )
-            time.sleep(10)
-            seconds_waited += 10
-            if seconds_waited % retry_interval == 0:
-                print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
-                code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
-                if code == 53:
-                    print("Still rate limited.")
-        if code != 53:
-            print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
         write_key(code, key)
     print(f"\n{'='*60}")
     print(f"Completed retry pass: {total_retry} keys processed")
@@ -2735,45 +2727,36 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             continue
 
         code = _redeem_steam(session, key["redeemed_key_val"])
-        retry_interval = 300  # 5 minutes between retries (rate limit lasts ~1 hour)
-        seconds_waited = 0
         rate_limited_this_key = False
-        while code == 53:
+        if code == 53:
             """NOTE
             Steam seems to limit to about 50 keys/hr -- even if all 50 keys are legitimate *sigh*
             Even worse: 10 *failed* keys/hr
             Duplication counts towards Steam's _failure rate limit_,
             hence why we've worked so hard above to figure out what we already own
             """
-            if not rate_limited_this_key:
-                rate_limited_this_key = True
-                rate_limit_count += 1
+            rate_limited_this_key = True
+            rate_limit_count += 1
+            # Track initial wait time for statistics
+            wait_start_time = time.time()
             
-            minutes_waited = seconds_waited // 60
-            next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
-            print(
-                f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
-                end="\r",
+            # Use reusable rate limit handler
+            code = wait_for_rate_limit_clear(
+                session,
+                key["redeemed_key_val"],
+                remaining,
+                keepalive=keepalive,
+                retry_interval=RATE_LIMIT_RETRY_INTERVAL_SECONDS,
+                check_interval=RATE_LIMIT_CHECK_INTERVAL_SECONDS
             )
-            time.sleep(10)
-            seconds_waited += 10
-            rate_limit_total_wait_time += 10
-            # Keep session alive during wait
-            if seconds_waited % 60 == 0:  # Every minute
-                keepalive.check()
-            if seconds_waited % retry_interval == 0:
-                # Try again every 5 minutes
-                print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
-                code = _redeem_steam(session, key["redeemed_key_val"], quiet=True)
-                if code == 53:
-                    print("Still rate limited.")
-        if code != 53:
-            # Rate limit cleared, show remaining count
-            if rate_limited_this_key:
-                total_wait_minutes = seconds_waited // 60
-                print(f"\n✓ Rate limit cleared after waiting {total_wait_minutes} minutes! Continuing with {remaining} keys remaining...\n")
-            else:
-                print(f"\n✓ Continuing with {remaining} keys remaining...\n")
+            
+            # Update statistics
+            if code != 53:
+                wait_duration = int(time.time() - wait_start_time)
+                rate_limit_total_wait_time += wait_duration
+                total_wait_minutes = wait_duration // 60
+                if total_wait_minutes > 0:
+                    print(f"\n✓ Rate limit cleared after {total_wait_minutes}m! Continuing with {remaining} keys remaining...\n")
 
         write_key(code, key)
     keepalive.disable()
@@ -3696,33 +3679,16 @@ The error details have been logged for debugging.
                         continue
                     
                     code = _redeem_steam(steam_session, key["redeemed_key_val"])
-                    
-                    # Rate-limit handling INSIDE the for loop
-                    retry_interval = 300  # 5 minutes between retries
-                    seconds_waited = 0
-                    rate_limited_this_key = False
-                    
-                    while code == 53:
-                        if not rate_limited_this_key:
-                            rate_limited_this_key = True
-                        
-                        minutes_waited = seconds_waited // 60
-                        next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
-                        print(
-                            f"Rate limited. Waited {minutes_waited}m, retrying in {next_retry}m (limit clears in ~1hr) - {remaining} keys remaining   ",
-                            end="\r",
+                    if code == 53:
+                        # Use reusable rate limit handler
+                        code = wait_for_rate_limit_clear(
+                            steam_session,
+                            key["redeemed_key_val"],
+                            remaining,
+                            keepalive=None,  # No keepalive in retry context
+                            retry_interval=RATE_LIMIT_RETRY_INTERVAL_SECONDS,
+                            check_interval=RATE_LIMIT_CHECK_INTERVAL_SECONDS
                         )
-                        time.sleep(10)
-                        seconds_waited += 10
-                        if seconds_waited % retry_interval == 0:
-                            print(f"\nRetrying after {seconds_waited // 60} minutes... ({remaining} keys remaining)")
-                            code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
-                            if code == 53:
-                                print("Still rate limited.")
-                    
-                    if code != 53 and rate_limited_this_key:
-                        total_wait_minutes = seconds_waited // 60
-                        print(f"\n✓ Rate limit cleared after waiting {total_wait_minutes} minutes! Continuing with {remaining} keys remaining...\n")
                     
                     # Write key INSIDE the for loop
                     write_key(code, key)
