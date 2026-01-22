@@ -3023,7 +3023,7 @@ def cls():
 def print_main_header():
     """Print script header."""
     if not AUTO_MODE:
-        print("-=FailSpy's Humble Bundle Helper!=-")
+        print("-=frimodig's Humble Bundle Helper!=- (Based on original script by FailSpy)")
     print("--------------------------------------")
 
 
