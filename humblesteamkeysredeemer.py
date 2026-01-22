@@ -2024,8 +2024,9 @@ def retry_errored_keys(humble_session, steam_session, order_details):
     errored_file = "errored.csv"
     if not os.path.exists(errored_file):
         return
-    # Read errored keys
-    errored_keys = []
+    # Read errored keys with deduplication - prefer valid keys over empty/invalid ones
+    # IMPORTANT: Deduplicate by (gamekey, name) to prevent processing the same game multiple times
+    errored_dict = {}  # (gamekey, name) -> best entry
     try:
         with open(errored_file, "r", encoding="utf-8-sig") as f:
             reader = csv.reader(f)
@@ -2034,45 +2035,108 @@ def retry_errored_keys(humble_session, steam_session, order_details):
             if first_row and first_row[0].lower() != "gamekey":
                 # First row is data, not header
                 if len(first_row) >= 3:
-                    gamekey, human_name, redeemed_key_val = first_row[0], first_row[1], first_row[2]
-                    errored_keys.append({
-                        "gamekey": gamekey,
-                        'human_name': human_name,
-                        "redeemed_key_val": redeemed_key_val
-                    })
+                    gamekey = first_row[0].strip()
+                    human_name = first_row[1].strip()
+                    redeemed_key_val = first_row[2].strip()
+                    key_id = (gamekey, human_name.lower())
+                    # Only keep if we don't have a better (valid) key already
+                    if key_id not in errored_dict or (
+                        not valid_steam_key(errored_dict[key_id]["redeemed_key_val"]) and 
+                        valid_steam_key(redeemed_key_val)
+                    ):
+                        errored_dict[key_id] = {
+                            "gamekey": gamekey,
+                            'human_name': human_name,
+                            "redeemed_key_val": redeemed_key_val
+                        }
             # Read remaining rows
             for row in reader:
                 if len(row) >= 3:
-                    gamekey, human_name, redeemed_key_val = row[0], row[1], row[2]
-                    errored_keys.append({
-                        "gamekey": gamekey,
-                        'human_name': human_name,
-                        "redeemed_key_val": redeemed_key_val
-                    })
+                    gamekey = row[0].strip()
+                    human_name = row[1].strip()
+                    redeemed_key_val = row[2].strip()
+                    key_id = (gamekey, human_name.lower())
+                    # Only keep if we don't have a better (valid) key already
+                    if key_id not in errored_dict or (
+                        not valid_steam_key(errored_dict[key_id]["redeemed_key_val"]) and 
+                        valid_steam_key(redeemed_key_val)
+                    ):
+                        errored_dict[key_id] = {
+                            "gamekey": gamekey,
+                            'human_name': human_name,
+                            "redeemed_key_val": redeemed_key_val
+                        }
     except Exception as e:
         print(f"Error reading {errored_file}: {e}")
         return
+    
+    # Convert to list and filter out invalid keys BEFORE matching
+    errored_keys = []
+    for entry in errored_dict.values():
+        key_val = entry["redeemed_key_val"]
+        # Skip empty, expired, or invalid keys - don't even try to match them
+        if not key_val or key_val == "" or key_val == "EXPIRED":
+            continue
+        if not valid_steam_key(key_val):
+            continue
+        errored_keys.append(entry)
+    
     if not errored_keys:
+        print(f"\n{'='*60}")
+        print(f"No valid keys found in errored.csv to retry (all are empty/invalid/expired)")
+        print(f"{'='*60}\n")
         return
+    
     print(f"\n{'='*60}")
-    print(f"Retrying {len(errored_keys)} previously errored keys...")
+    print(f"Retrying {len(errored_keys)} previously errored keys (after deduplication and filtering)...")
     print(f"{'='*60}\n")
+    
     # Match errored keys back to order_details
+    # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
     all_steam_keys = list(find_dict_keys(order_details, "steam_app_id", True))
     keys_to_retry = []
+    seen_retry_keys = set()  # Track (gamekey, name) to avoid duplicates
+    
     for errored in errored_keys:
-        # Try to find matching key in order_details
+        errored_gamekey = errored["gamekey"]
+        errored_name = errored["human_name"].strip().lower()
+        errored_key_val = errored["redeemed_key_val"]
+        
+        # Skip if already processed (deduplication by gamekey + name)
+        retry_id = (errored_gamekey, errored_name)
+        if retry_id in seen_retry_keys:
+            continue  # Already processed this exact game
+        seen_retry_keys.add(retry_id)
+        
+        # Try to find matching key in order_details - prefer exact name match
+        matched = False
         for key in all_steam_keys:
-            if (key.get("gamekey") == errored["gamekey"] or 
-                key.get("redeemed_key_val") == errored["redeemed_key_val"]):
+            key_gamekey = key.get("gamekey", "")
+            key_name = key.get("human_name", "").strip().lower()
+            
+            # Match by both gamekey AND name for accuracy
+            if key_gamekey == errored_gamekey and key_name == errored_name:
                 # Update with the redeemed_key_val from errored.csv
-                key["redeemed_key_val"] = errored["redeemed_key_val"]
+                key["redeemed_key_val"] = errored_key_val
                 keys_to_retry.append(key)
+                matched = True
                 break
+        
+        # Fallback: if no exact match, try matching by gamekey only (for backward compatibility)
+        # But only if we haven't already added this gamekey
+        if not matched:
+            for key in all_steam_keys:
+                if key.get("gamekey") == errored_gamekey:
+                    # Check if we've already added this gamekey
+                    if not any(k.get("gamekey") == errored_gamekey for k in keys_to_retry):
+                        key["redeemed_key_val"] = errored_key_val
+                        keys_to_retry.append(key)
+                        break
+    
     if not keys_to_retry:
         print("No matching keys found in order details to retry.")
         return
-    print(f"Found {len(keys_to_retry)} keys to retry out of {len(errored_keys)} errored.\n")
+    print(f"Found {len(keys_to_retry)} keys to retry out of {len(errored_keys)} errored (after deduplication).\n")
     # Retry the keys
     total_retry = len(keys_to_retry)
     for idx, key in enumerate(keys_to_retry, 1):
