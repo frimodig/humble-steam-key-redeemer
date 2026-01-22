@@ -41,6 +41,19 @@ try:
 except ImportError:
     HAS_ENCRYPTION = False
 
+# Try to import file locking support
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
+
 # Auto mode flag - when True, auto-answers prompts for daemon/unattended operation
 AUTO_MODE = False
 
@@ -203,7 +216,8 @@ headers = {
 }
 
 # Script execution timeout (seconds)
-# Legacy constant for backward compatibility (use SCRIPT_TIMEOUT_SECONDS instead)
+# Legacy constant for backward compatibility - use SCRIPT_TIMEOUT_SECONDS in new code
+# TODO: Remove this after full migration to SCRIPT_TIMEOUT_SECONDS
 SCRIPT_TIMEOUT = SCRIPT_TIMEOUT_SECONDS
 
 
@@ -250,7 +264,7 @@ def refresh_page_if_needed(driver, url=None):
             driver.get(url)
         else:
             driver.refresh()
-        time.sleep(2)
+        time.sleep(DEFAULT_SLEEP_SECONDS)
         return True
     except Exception as e:
         print(f"[DEBUG] Failed to refresh page: {e}")
@@ -468,7 +482,7 @@ def perform_post(driver, url, payload, max_retries=3):
                 if attempt < max_retries - 1:
                     print(f"[DEBUG] Session invalid, refreshing... (attempt {attempt + 1}/{max_retries})")
                     refresh_page_if_needed(driver, "https://www.humblebundle.com/home/library")
-                    time.sleep(2)
+                    time.sleep(DEFAULT_SLEEP_SECONDS)
                 else:
                     raise InvalidSessionIdException("WebDriver session is invalid after retries")
             
@@ -785,7 +799,7 @@ def get_browser_driver(headless=True):
         for browser, exception in exceptions:
             print(f"  {browser} {exception}")
 
-    time.sleep(30)
+    time.sleep(VERY_LONG_SLEEP_SECONDS)
     sys.exit(1)
 
 MODE_PROMPT = """Welcome to the Humble Exporter!
@@ -1349,7 +1363,7 @@ def do_login(driver,payload):
     auth,login_json = perform_post(driver,HUMBLE_LOGIN_API,payload)
     if auth not in (200,401):
         print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses.get(auth, 'Unknown')}).")
-        time.sleep(30)
+        time.sleep(VERY_LONG_SLEEP_SECONDS)
         sys.exit(1)
     return auth,login_json
 
@@ -1364,9 +1378,9 @@ def humble_login(driver, is_headless=True):
     if cookies_exist:
         try:
             driver.get("https://www.humblebundle.com/")
-            time.sleep(2)  # Let cookies load
+            time.sleep(DEFAULT_SLEEP_SECONDS)  # Let cookies load
             if try_recover_cookies(cookie_file, driver):
-                time.sleep(1)
+                time.sleep(SHORT_SLEEP_SECONDS)
                 if verify_logins_session(driver)[0]:
                     print("Using saved Humble session.")
                     return driver, True
@@ -1397,7 +1411,7 @@ def humble_login(driver, is_headless=True):
     # Go to login page (only in non-auto mode - try API login first)
     try:
         driver.get(HUMBLE_LOGIN_PAGE)
-        time.sleep(2)  # Let page fully load
+        time.sleep(DEFAULT_SLEEP_SECONDS)  # Let page fully load
     except Exception as e:
         print(f"Error loading Humble login page: {e}")
         driver.quit()
@@ -1542,7 +1556,7 @@ def humble_login_manual(driver):
     input("Press Enter after you've logged in successfully...")
     # Verify login worked
     driver.get("https://www.humblebundle.com/home/library")
-    time.sleep(2)
+    time.sleep(DEFAULT_SLEEP_SECONDS)
     if "login" in driver.current_url.lower():
         print("Login verification failed - still on login page. Please try again.")
         return humble_login_manual(driver)  # Retry
@@ -1624,11 +1638,11 @@ def redeem_humble_key(sess, tpk, max_retries=3):
                 if not refresh_page_if_needed(sess, "https://www.humblebundle.com/home/library"):
                     if attempt < max_retries - 1:
                         print(f"  -> Recovery failed, retrying... (attempt {attempt + 2}/{max_retries})")
-                        time.sleep(2)
+                        time.sleep(DEFAULT_SLEEP_SECONDS)
                         continue
                     print(f"  -> Failed to recover session for {tpk['human_name']}")
                     return ""
-                time.sleep(2)
+                time.sleep(DEFAULT_SLEEP_SECONDS)
             
             status, respjson = perform_post(sess, HUMBLE_REDEEM_API, payload)
             
@@ -1636,7 +1650,7 @@ def redeem_humble_key(sess, tpk, max_retries=3):
                 print(f"  -> HTTP {status} while redeeming {tpk['human_name']}")
                 if attempt < max_retries - 1:
                     print(f"  -> Retrying... (attempt {attempt + 2}/{max_retries})")
-                    time.sleep(2)
+                    time.sleep(DEFAULT_SLEEP_SECONDS)
                     continue
                 return ""
             
@@ -1660,7 +1674,7 @@ def redeem_humble_key(sess, tpk, max_retries=3):
         except TimeoutException:
             print(f"  -> Timeout (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                time.sleep(3)
+                time.sleep(LONG_SLEEP_SECONDS)
                 continue
             return ""
             
@@ -1671,7 +1685,7 @@ def redeem_humble_key(sess, tpk, max_retries=3):
                 print(f"  -> Attempting to recover session...")
                 try:
                     sess.get("https://www.humblebundle.com/home/library")
-                    time.sleep(3)
+                    time.sleep(LONG_SLEEP_SECONDS)
                 except:
                     pass
                 continue
@@ -1683,7 +1697,7 @@ def redeem_humble_key(sess, tpk, max_retries=3):
             print(f"  -> {error_type}: {error_msg}")
             if attempt < max_retries - 1:
                 print(f"  -> Retrying... (attempt {attempt + 2}/{max_retries})")
-                time.sleep(2)
+                time.sleep(DEFAULT_SLEEP_SECONDS)
                 continue
             return ""
     
@@ -1942,44 +1956,54 @@ def get_csv_writer(code):
     # Check if we need to write header
     file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
     
-    # Try to import file locking support
-    try:
-        import fcntl  # Unix
-        has_flock = True
-    except ImportError:
-        try:
-            import msvcrt  # Windows
-            has_flock = True
-        except ImportError:
-            has_flock = False
+    f = open(filename, "a", encoding="utf-8-sig", newline='')
+    lock_acquired = False
     
-    with open(filename, "a", encoding="utf-8-sig", newline='') as f:
+    try:
         # Acquire exclusive lock for writing
-        if has_flock:
+        if HAS_FCNTL:
+            # Unix: flock locks entire file
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            lock_acquired = True
+        elif HAS_MSVCRT:
+            # Windows: byte-range locking - lock entire file (up to 2GB)
+            # Use non-blocking lock with retry mechanism
+            max_retries = 5
+            lock_size = 2147483647  # Lock up to 2GB (effectively entire file)
+            
+            for attempt in range(max_retries):
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, lock_size)
+                    lock_acquired = True
+                    break
+                except IOError as e:
+                    if attempt == max_retries - 1:
+                        # Last attempt failed - log but continue (better than failing completely)
+                        print(f"[WARNING] Could not acquire file lock for {filename}: {e}", file=sys.stderr, flush=True)
+                        break
+                    time.sleep(0.1)  # Wait 100ms before retry
+        
+        if file_needs_header:
+            f.write("gamekey,human_name,redeemed_key_val\n")
+        
+        yield f
+        f.flush()
+        
+    finally:
+        # Always release lock and close file
+        if lock_acquired:
             try:
-                if os.name == 'nt':  # Windows
-                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-                else:  # Unix
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                if HAS_FCNTL:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                elif HAS_MSVCRT:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 2147483647)
             except (OSError, IOError):
-                # Locking failed, but continue anyway (better than failing completely)
-                pass
+                pass  # Ignore unlock errors (file may already be closed)
         
         try:
-            if file_needs_header:
-                f.write("gamekey,human_name,redeemed_key_val\n")
-            yield f
-            f.flush()
-        finally:
-            # Release lock
-            if has_flock:
-                try:
-                    if os.name == 'nt':  # Windows
-                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:  # Unix
-                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                except (OSError, IOError):
-                    pass
+            f.close()
+        except:
+            pass  # Ignore close errors
 
 
 def write_key(code, key):
@@ -2182,7 +2206,7 @@ def _fetch_all_apps(steam_session):
             resp = steam_session.get(url, params=params, timeout=30)
         except requests.exceptions.Timeout:
             print("Timeout while fetching Steam app list. Retrying...")
-            time.sleep(5)
+            time.sleep(EXTENDED_SLEEP_SECONDS)
             continue
         except requests.exceptions.RequestException as e:
             print(f"Network error while fetching Steam app list: {e}")
@@ -2948,7 +2972,7 @@ def humble_chooser_mode(humble_session,order_details):
 
                 if(len(invalid) > 0):
                     print("Error interpreting options: " + ','.join(invalid))
-                    time.sleep(2)
+                    time.sleep(DEFAULT_SLEEP_SECONDS)
                 else:
                     user_input = set(int(opt) for opt in user_input) # Uniques
                     chosen = [choice for idx,choice in enumerate(choices) if idx+1 in user_input]
@@ -2956,7 +2980,7 @@ def humble_chooser_mode(humble_session,order_details):
 
                     if len(chosen) > remaining:
                         print(f"Too many games chosen, you have only {remaining} choices left")
-                        time.sleep(2)
+                        time.sleep(DEFAULT_SLEEP_SECONDS)
                     else:
                         print("\nGames selected:")
                         for choice in chosen:
@@ -3055,7 +3079,7 @@ if __name__=="__main__":
         print("Loading Humble Bundle page...", end=" ", flush=True)
         try:
             driver.get("https://www.humblebundle.com/home/library")
-            time.sleep(2)  # Let page load
+            time.sleep(DEFAULT_SLEEP_SECONDS)  # Let page load
             
             # Check if page loaded properly
             try:
@@ -3166,7 +3190,7 @@ if __name__=="__main__":
                     if driver_pid:
                         try:
                             os.kill(driver_pid, signal.SIGTERM)
-                            time.sleep(1)
+                            time.sleep(SHORT_SLEEP_SECONDS)
                             os.kill(driver_pid, signal.SIGKILL)
                         except:
                             pass
@@ -3213,7 +3237,7 @@ if __name__=="__main__":
                         try:
                             print(f"[DEBUG] Killing browser process {driver_pid}...", file=sys.stderr, flush=True)
                             os.kill(driver_pid, signal.SIGTERM)
-                            time.sleep(1)
+                            time.sleep(SHORT_SLEEP_SECONDS)
                             # If still alive, force kill
                             try:
                                 os.kill(driver_pid, signal.SIGKILL)
@@ -3222,7 +3246,7 @@ if __name__=="__main__":
                         except Exception as kill_err:
                             print(f"[DEBUG] Could not kill process: {kill_err}", file=sys.stderr, flush=True)
                     
-                    time.sleep(2)
+                    time.sleep(DEFAULT_SLEEP_SECONDS)
                     
                     if AUTO_MODE:
                         print("\nThis may require running manually to establish a fresh session:")
