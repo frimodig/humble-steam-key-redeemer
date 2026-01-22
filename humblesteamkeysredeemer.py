@@ -783,76 +783,301 @@ def valid_steam_key(key):
     )
 
 
-def is_friend_or_coop_key(key):
+def is_friend_or_coop_key(key, confidence_threshold=0.8):
     """
     Detect if a key is a friend/co-op pass that should not be redeemed.
-    Returns (is_friend_key, reason) tuple.
+    Returns (is_friend_key, reason, confidence) tuple.
+    Confidence: 1.0 = certain, 0.5-0.99 = likely, <0.5 = uncertain
     """
-    # Common patterns for friend/co-op keys (case-insensitive)
-    FRIEND_PATTERNS = [
-        # Generic friend pass indicators
+    import re
+    
+    # High confidence patterns (definitely friend keys)
+    HIGH_CONFIDENCE_PATTERNS = [
         'friend pass', 'friends pass', 'friend\'s pass',
-        'friend key', 'friends key', 'friend\'s key',  # Friend keys (not just passes)
-        'guest pass', 'guest key',
-        'extra copy', 'extra key',
+        'guest pass', 'guest key', 'guest access',
+        'extra copy', 'bonus copy',
         'co-op pass', 'coop pass', 'co op pass',
-        'multiplayer pass', 'multi-player pass',
-        'buddy pass', 'companion pass',
-        'invite key', 'invitation key',
-        'gift copy', 'giftable copy',
-        'additional copy',
-        'bonus copy',
-        
-        # Specific known games with friend keys
-        'minion masters',  # Known for friend keys
-        'dont starve together',  # Has friend copies
-        'portal 2',  # Has extra copy
-        'serious sam',  # Multiple friend keys
     ]
     
-    # Load custom exclusions from file (optional)
+    # Medium confidence patterns (probably friend keys)
+    MEDIUM_CONFIDENCE_PATTERNS = [
+        'friend key', 'friends key', 'friend\'s key',
+        'multiplayer pass', 'multi-player pass',
+        'companion pass',
+        'invite key', 'invitation key', 'invite pass',
+        'additional copy', 'additional key',
+        '2-pack', '3-pack', '4-pack',  # Multi-packs often have extra copies
+        '2 pack', '3 pack', '4 pack',
+        'gift copy', 'giftable copy', 'gift key',
+        'buddy pass', 'buddy key',
+        'spare copy', 'spare key',
+    ]
+    
+    # Low confidence patterns (might be friend keys)
+    LOW_CONFIDENCE_PATTERNS = [
+        'extra', 'bonus', 'additional',
+    ]
+    
+    # Exact match patterns (must match exactly, not substring)
+    EXACT_MATCH_PATTERNS = [
+        'extra',  # Too generic as substring
+        'bonus',  # Too generic as substring
+    ]
+    
+    # Common suffixes indicating friend keys
+    SUFFIX_PATTERNS = [
+        ' - extra', ' (extra)', '[extra]',
+        ' - friend', ' (friend)', '[friend]',
+        ' - guest', ' (guest)', '[guest]',
+        ' - gift', ' (gift)', '[gift]',
+    ]
+    
+    # Specific known games with friend keys
+    KNOWN_FRIEND_GAMES = [
+        'minion masters',  # Known for friend keys
+        'dont starve together',  # Has friend copies
+        "don't starve together",  # Alternate spelling
+        'portal 2',  # Has extra copy
+        'serious sam',  # Multiple friend keys
+        'dead island',  # Has guest passes
+        'killing floor',  # Has guest passes
+        'castle crashers',  # Has extra copies
+        'battleblock theater',  # Has extra copies
+        'counter-strike',  # Has guest passes
+        'half-life 2',  # Has guest passes
+        'dead by daylight - stranger things',  # Friend pass DLC
+        'insurgency',  # Has extra copies in bundles
+        'arma',  # Often includes friend passes
+    ]
+    
+    # DLC/Content that shouldn't be auto-redeemed
+    NON_GAME_CONTENT = [
+        'soundtrack', 'ost', 'original soundtrack',
+        'artbook', 'art book',
+        'digital comic', 'comic book',
+        'wallpaper', 'avatar', 'badge',
+    ]
+    
+    # Load custom patterns with confidence levels
     try:
         with open("friend_key_exclusions.txt", "r", encoding="utf-8") as f:
-            custom_patterns = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
-            FRIEND_PATTERNS.extend(custom_patterns)
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # Format: "pattern" or "HIGH:pattern" or "MEDIUM:pattern" or "LOW:pattern" or "EXACT:pattern"
+                    if ":" in line:
+                        prefix, pattern = line.split(":", 1)
+                        prefix = prefix.strip().upper()
+                        pattern = pattern.strip().lower()
+                        if prefix == "HIGH":
+                            HIGH_CONFIDENCE_PATTERNS.append(pattern)
+                        elif prefix == "MEDIUM":
+                            MEDIUM_CONFIDENCE_PATTERNS.append(pattern)
+                        elif prefix == "LOW":
+                            LOW_CONFIDENCE_PATTERNS.append(pattern)
+                        elif prefix == "EXACT":
+                            EXACT_MATCH_PATTERNS.append(pattern)
+                        else:
+                            # Default to medium confidence for custom patterns
+                            MEDIUM_CONFIDENCE_PATTERNS.append(pattern)
+                    else:
+                        # Default to medium confidence for custom patterns
+                        MEDIUM_CONFIDENCE_PATTERNS.append(line.lower())
     except FileNotFoundError:
         pass
+    except Exception as e:
+        print(f"[DEBUG] Error loading friend_key_exclusions.txt: {e}")
     
     # Fields to check
     human_name = key.get('human_name', '').lower()
     machine_name = key.get('machine_name', '').lower()
     key_type = key.get('key_type_human_name', '').lower()
     
-    # Check all fields for patterns
-    for pattern in FRIEND_PATTERNS:
+    # Check high confidence patterns first
+    for pattern in HIGH_CONFIDENCE_PATTERNS:
         if pattern in human_name:
-            return True, f"human_name contains '{pattern}'"
+            return True, f"human_name contains '{pattern}'", 1.0
         if pattern in machine_name:
-            return True, f"machine_name contains '{pattern}'"
+            return True, f"machine_name contains '{pattern}'", 1.0
         if pattern in key_type:
-            return True, f"key_type contains '{pattern}'"
+            return True, f"key_type contains '{pattern}'", 1.0
     
-    return False, ""
+    # Check suffix patterns (high confidence)
+    for pattern in SUFFIX_PATTERNS:
+        if human_name.endswith(pattern):
+            return True, f"human_name ends with '{pattern}'", 1.0
+        if machine_name.endswith(pattern):
+            return True, f"machine_name ends with '{pattern}'", 1.0
+    
+    # Check known friend games (medium-high confidence)
+    for pattern in KNOWN_FRIEND_GAMES:
+        if pattern in human_name:
+            return True, f"known friend game: '{pattern}'", 0.85
+        if pattern in machine_name:
+            return True, f"known friend game: '{pattern}'", 0.85
+    
+    # Check medium confidence patterns
+    for pattern in MEDIUM_CONFIDENCE_PATTERNS:
+        if pattern in human_name:
+            return True, f"human_name contains '{pattern}'", 0.75
+        if pattern in machine_name:
+            return True, f"machine_name contains '{pattern}'", 0.75
+        if pattern in key_type:
+            return True, f"key_type contains '{pattern}'", 0.75
+    
+    # Check non-game content (medium confidence)
+    for pattern in NON_GAME_CONTENT:
+        if pattern in human_name:
+            return True, f"non-game content: '{pattern}'", 0.7
+        if pattern in machine_name:
+            return True, f"non-game content: '{pattern}'", 0.7
+    
+    # Check low confidence patterns with word boundaries
+    for pattern in LOW_CONFIDENCE_PATTERNS:
+        pattern_regex = r'\b' + re.escape(pattern) + r'\b'
+        if re.search(pattern_regex, human_name):
+            return True, f"human_name contains '{pattern}' (low confidence)", 0.5
+        if re.search(pattern_regex, machine_name):
+            return True, f"machine_name contains '{pattern}' (low confidence)", 0.5
+        if re.search(pattern_regex, key_type):
+            return True, f"key_type contains '{pattern}' (low confidence)", 0.5
+    
+    # Check exact match patterns (word boundaries)
+    for pattern in EXACT_MATCH_PATTERNS:
+        pattern_regex = r'\b' + re.escape(pattern) + r'\b'
+        if re.search(pattern_regex, human_name):
+            return True, f"human_name exactly matches '{pattern}'", 0.6
+        if re.search(pattern_regex, machine_name):
+            return True, f"machine_name exactly matches '{pattern}'", 0.6
+        if re.search(pattern_regex, key_type):
+            return True, f"key_type exactly matches '{pattern}'", 0.6
+    
+    return False, "", 0.0
 
 
-def save_friend_key(key, reason=""):
-    """Save friend/co-op keys to a separate CSV for gifting."""
+def save_friend_key(key, reason="", confidence=1.0):
+    """Save friend/co-op keys to a separate CSV for gifting with enhanced metadata."""
     filename = "friend_keys.csv"
     
     # Check if we need to write header
     file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
     
+    # Check for duplicates before writing
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 4:
+                        existing_gamekey = row[3].strip()
+                        existing_name = row[0].strip().lower()
+                        if existing_gamekey == key.get('gamekey', '') and existing_name == key.get('human_name', '').lower():
+                            # Duplicate found - skip writing
+                            return
+        except Exception:
+            pass
+    
     with open(filename, "a", encoding="utf-8-sig", newline='') as f:
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         if file_needs_header:
-            writer.writerow(["human_name", "redeemed_key_val", "gamekey", "reason"])
+            writer.writerow(["human_name", "key_type", "redeemed_key_val", "gamekey", "steam_app_id", "reason", "confidence"])
         writer.writerow([
             key.get('human_name', ''),
+            key.get('key_type_human_name', 'Unknown'),
             key.get('redeemed_key_val', 'NOT_REVEALED'),
             key.get('gamekey', ''),
-            reason
+            key.get('steam_app_id', ''),
+            reason,
+            f"{int(confidence * 100)}%"
         ])
         f.flush()
+
+
+def review_uncertain_friend_keys(uncertain_keys):
+    """
+    Let users review keys flagged as friend keys with low confidence.
+    Returns list of keys to skip (confirmed friend keys).
+    """
+    global AUTO_MODE
+    
+    if not uncertain_keys:
+        return []
+    
+    if AUTO_MODE:
+        # In auto mode, skip all uncertain keys (safer)
+        print(f"(auto-mode: skipping {len(uncertain_keys)} uncertain friend/co-op keys)")
+        return uncertain_keys
+    
+    print(f"\n{'='*60}")
+    print(f"REVIEW: {len(uncertain_keys)} keys might be friend/co-op keys")
+    print(f"{'='*60}")
+    print("These keys have patterns suggesting they might be friend keys,")
+    print("but we're not 100% certain. Please review:\n")
+    
+    confirmed_friend_keys = []
+    
+    for i, (key, reason, confidence) in enumerate(uncertain_keys, 1):
+        print(f"\n[{i}/{len(uncertain_keys)}] {key['human_name']}")
+        print(f"  Reason: {reason}")
+        print(f"  Confidence: {int(confidence * 100)}%")
+        print(f"  Type: {key.get('key_type_human_name', 'Unknown')}")
+        
+        is_friend = prompt_yes_no(f"  Is this a friend/co-op key that should be saved for gifting?", default_yes=True)
+        if is_friend:
+            confirmed_friend_keys.append(key)
+    
+    return confirmed_friend_keys
+
+
+def create_sample_friend_exclusions():
+    """Create a sample friend_key_exclusions.txt if it doesn't exist."""
+    filename = "friend_key_exclusions.txt"
+    if os.path.exists(filename):
+        return  # Don't overwrite existing file
+    
+    sample_content = """# Friend Key Exclusions Configuration
+# Add patterns here (one per line) to skip keys that should be gifted, not redeemed
+# Lines starting with # are comments and will be ignored
+
+# === SYNTAX ===
+# Substring match (default): pattern
+# Exact word match: EXACT:pattern
+# High confidence: HIGH:pattern
+# Medium confidence: MEDIUM:pattern
+# Low confidence: LOW:pattern
+
+# === EXAMPLES ===
+# my custom pattern
+# EXACT:bonus
+# HIGH:special game name
+# MEDIUM:maybe friend key
+# LOW:uncertain pattern
+
+# === COMMON ADDITIONS ===
+# Uncomment (remove #) to enable:
+
+# Game-specific friend passes
+# payday 2
+# rocket league
+# terraria
+
+# Content types you want to gift
+# deluxe edition
+# premium edition
+# collector's edition
+
+# Non-game items
+# soundtrack
+# artbook
+# making of
+"""
+    
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(sample_content)
+        print(f"[INFO] Created sample {filename} - customize it to add your own patterns")
+    except Exception as e:
+        print(f"[DEBUG] Could not create sample {filename}: {e}")
 
 
 class SecureCookieManager:
@@ -2227,63 +2452,86 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         default_yes=True
     )
 
-    # IMPORTANT: Don't filter unrevealed keys by Steam ownership - we need to reveal them first!
-    # Unrevealed keys don't have redeemed_key_val yet, so we can't know if they're owned
-    revealed_keys_to_check = [key for key in humble_keys if "redeemed_key_val" in key]
-    unrevealed_keys_to_process = [key for key in humble_keys if "redeemed_key_val" not in key]
-    
-    # Only filter revealed keys by Steam ownership
-    noted_keys = [key for key in revealed_keys_to_check if key.get("steam_app_id") not in owned_app_details.keys()]
     skipped_games = {}
     unownedgames = []
-    friend_keys_skipped = []  # Track skipped friend keys
+    friend_keys_skipped = []  # Track skipped friend keys (high confidence)
+    uncertain_friend_keys = []  # Track uncertain friend keys (low confidence)
 
     # Some Steam keys come back with no Steam AppID from Humble
     # So we do our best to look up from AppIDs (no packages, because can't find an API for it)
 
     filter_live = prompt_filter_live() == "y"
 
-    # Process revealed keys (check ownership)
-    for game in noted_keys:
-        # Check if it's a friend/co-op key FIRST
+    # Process ALL keys in a single unified loop
+    for key in humble_keys:
+        # Check if it's a friend/co-op key FIRST (works on both revealed and unrevealed)
         if skip_friend_keys:
-            is_friend, reason = is_friend_or_coop_key(game)
+            is_friend, reason, confidence = is_friend_or_coop_key(key)
             if is_friend:
-                friend_keys_skipped.append((game, reason))
-                continue  # Skip this key entirely
+                # High confidence (>= 0.8) - automatically skip
+                if confidence >= 0.8:
+                    friend_keys_skipped.append((key, reason, confidence))
+                    continue  # Skip this key entirely
+                else:
+                    # Low confidence - mark for review
+                    uncertain_friend_keys.append((key, reason, confidence))
+                    # Don't skip yet - will review later
         
-        best_match = match_ownership(owned_app_details,game,filter_live)
-        if best_match[1] is not None and best_match[1] in owned_app_details.keys():
-            skipped_games[game['human_name'].strip()] = game
+        # Check if revealed and owned
+        is_revealed = "redeemed_key_val" in key
+        steam_app_id = key.get("steam_app_id")
+        
+        if is_revealed and steam_app_id in owned_app_details.keys():
+            # Definitely owned (exact AppID match)
+            skipped_games[key['human_name'].strip()] = key
+        elif is_revealed and steam_app_id not in owned_app_details.keys():
+            # Revealed but not in owned list - do fuzzy matching
+            best_match = match_ownership(owned_app_details, key, filter_live)
+            if best_match[1] is not None and best_match[1] in owned_app_details.keys():
+                skipped_games[key['human_name'].strip()] = key
+            else:
+                unownedgames.append(key)
         else:
-            unownedgames.append(game)
-
-    # Process unrevealed keys - check for friend/co-op keys but don't filter by Steam ownership
-    # (we need to reveal them first to know what they are)
-    for game in unrevealed_keys_to_process:
-        # Check if it's a friend/co-op key
-        if skip_friend_keys:
-            is_friend, reason = is_friend_or_coop_key(game)
-            if is_friend:
-                friend_keys_skipped.append((game, reason))
-                continue  # Skip this key entirely
-        # Add to unownedgames - we'll reveal and redeem it
-        unownedgames.append(game)
+            # Unrevealed - can't check ownership yet, add to process list
+            unownedgames.append(key)
+    
+    # Review uncertain friend keys
+    if uncertain_friend_keys:
+        print(f"\nFound {len(uncertain_friend_keys)} keys that might be friend/co-op keys...")
+        confirmed = review_uncertain_friend_keys(uncertain_friend_keys)
+        
+        # Move confirmed friend keys from unownedgames to friend_keys_skipped
+        for key in confirmed:
+            if key in unownedgames:
+                unownedgames.remove(key)
+            # Find the full entry with reason/confidence
+            for uncertain_key, reason, confidence in uncertain_friend_keys:
+                if uncertain_key == key:
+                    friend_keys_skipped.append((key, reason, confidence))
+                    break
+    
+    # Count revealed vs unrevealed
+    revealed_count = sum(1 for key in unownedgames if "redeemed_key_val" in key)
+    unrevealed_count = len(unownedgames) - revealed_count
     
     print(
-        "Filtered out game keys that you already own on Steam; {} keys unowned ({} revealed, {} unrevealed).".format(
-            len(unownedgames),
-            len(unownedgames) - len(unrevealed_keys_to_process),
-            len(unrevealed_keys_to_process)
-        )
+        f"\nFiltered out game keys that you already own on Steam; {len(unownedgames)} keys unowned "
+        f"({revealed_count} revealed, {unrevealed_count} unrevealed)."
     )
     
-    # Report on friend keys
+    # Report on friend keys with examples
     if friend_keys_skipped:
-        print(f"Skipped {len(friend_keys_skipped)} friend/co-op keys (saved to friend_keys.csv)")
+        print(f"\nSkipped {len(friend_keys_skipped)} friend/co-op keys (saved to friend_keys.csv):")
+        # Show first 3 examples
+        for i, (key, reason, confidence) in enumerate(friend_keys_skipped[:3]):
+            conf_emoji = "🔒" if confidence >= 0.8 else "❓"
+            print(f"  {conf_emoji} {key['human_name']} ({reason})")
+        if len(friend_keys_skipped) > 3:
+            print(f"  ... and {len(friend_keys_skipped) - 3} more (see friend_keys.csv)")
+        
         # Save friend keys for later gifting
-        for key, reason in friend_keys_skipped:
-            save_friend_key(key, reason)
+        for key, reason, confidence in friend_keys_skipped:
+            save_friend_key(key, reason, confidence)
 
     if len(skipped_games):
         # Skipped games uncertain to be owned by user. Let user choose
@@ -2640,7 +2888,11 @@ if __name__=="__main__":
             print("RUNNING IN AUTO MODE")
             print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
             print("="*50)
-        # Always start headless - only switch to visible if manual login is needed
+        
+        # Create sample friend_key_exclusions.txt if it doesn't exist
+        create_sample_friend_exclusions()
+            
+            # Always start headless - only switch to visible if manual login is needed
         print("Starting browser...", end=" ", flush=True)
         driver = get_browser_driver(headless=True)
         print("OK")
@@ -3229,44 +3481,62 @@ The error details have been logged for debugging.
                 except Exception as e:
                     print(f"Warning: Error reading errored.csv: {e}")
             
-            # Update problematic keys with their redeemed_key_val from errored.csv
-            # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
-            keys_to_retry = []
-            seen_keys = set()  # Track by (gamekey, name) to avoid duplicates
-            
-            for key in problematic_keys:
-                gamekey = key.get("gamekey", "")
-                key_name = key.get("human_name", "").strip().lower()
+                # Update problematic keys with their redeemed_key_val from errored.csv
+                # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
+                keys_to_retry = []
+                seen_keys = set()  # Track by (gamekey, name) to avoid duplicates
+                friend_keys_in_problematic = []  # Track friend keys found in problematic keys
+                skip_friend_keys = True  # Use same setting as main flow
                 
-                # Skip duplicates (same gamekey + name combination)
-                key_id = (gamekey, key_name)
-                if key_id in seen_keys:
-                    continue  # Already processed this exact game
-                seen_keys.add(key_id)
-                
-                # Try to find matching key_val - prefer exact name match
-                key_val = None
-                if (gamekey, key_name) in errored_by_name:
-                    key_val = errored_by_name[(gamekey, key_name)]
-                elif gamekey in errored_dict:
-                    key_val = errored_dict[gamekey]
-                
-                if key_val:
-                    # Validate BEFORE adding to retry list
-                    if not key_val or key_val == "" or key_val == "EXPIRED":
-                        # Empty or expired - skip silently, will be handled by normal flow
-                        continue
-                    elif not valid_steam_key(key_val):
-                        # Invalid key format - skip silently to avoid spam
-                        continue
+                for key in problematic_keys:
+                    gamekey = key.get("gamekey", "")
+                    key_name = key.get("human_name", "").strip().lower()
+                    
+                    # Skip duplicates (same gamekey + name combination)
+                    key_id = (gamekey, key_name)
+                    if key_id in seen_keys:
+                        continue  # Already processed this exact game
+                    seen_keys.add(key_id)
+                    
+                    # Check if this is a friend key (shouldn't retry friend keys!)
+                    if skip_friend_keys:
+                        is_friend, reason, confidence = is_friend_or_coop_key(key)
+                        if is_friend and confidence >= 0.8:
+                            # Move to friend_keys.csv instead of retrying
+                            friend_keys_in_problematic.append((key, reason, confidence))
+                            continue
+                    
+                    # Try to find matching key_val - prefer exact name match
+                    key_val = None
+                    if (gamekey, key_name) in errored_by_name:
+                        key_val = errored_by_name[(gamekey, key_name)]
+                    elif gamekey in errored_dict:
+                        key_val = errored_dict[gamekey]
+                    
+                    if key_val:
+                        # Validate BEFORE adding to retry list
+                        if not key_val or key_val == "" or key_val == "EXPIRED":
+                            # Empty or expired - skip silently, will be handled by normal flow
+                            continue
+                        elif not valid_steam_key(key_val):
+                            # Invalid key format - skip silently to avoid spam
+                            continue
+                        else:
+                            # Valid key - set it and add to retry list
+                            key["redeemed_key_val"] = key_val
+                            keys_to_retry.append(key)
                     else:
-                        # Valid key - set it and add to retry list
-                        key["redeemed_key_val"] = key_val
-                        keys_to_retry.append(key)
-                else:
-                    # No entry in errored.csv for this specific game - skip silently
-                    # No need to retry if there's no key value in errored.csv
-                    continue
+                        # No entry in errored.csv for this specific game - skip silently
+                        # No need to retry if there's no key value in errored.csv
+                        continue
+            
+            # Save friend keys found in problematic list
+            if friend_keys_in_problematic:
+                print(f"Found {len(friend_keys_in_problematic)} friend keys in problematic list - moved to friend_keys.csv")
+                for key, reason, confidence in friend_keys_in_problematic:
+                    save_friend_key(key, f"from errored.csv: {reason}", confidence)
+                    # Remove from errored.csv
+                    remove_from_errored_csv(key.get("gamekey", ""), key.get("human_name", ""))
             
             if keys_to_retry:
                 # Retry these keys directly (they already have redeemed_key_val)
