@@ -792,6 +792,7 @@ def is_friend_or_coop_key(key):
     FRIEND_PATTERNS = [
         # Generic friend pass indicators
         'friend pass', 'friends pass', 'friend\'s pass',
+        'friend key', 'friends key', 'friend\'s key',  # Friend keys (not just passes)
         'guest pass', 'guest key',
         'extra copy', 'extra key',
         'co-op pass', 'coop pass', 'co op pass',
