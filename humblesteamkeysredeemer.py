@@ -783,6 +783,77 @@ def valid_steam_key(key):
     )
 
 
+def is_friend_or_coop_key(key):
+    """
+    Detect if a key is a friend/co-op pass that should not be redeemed.
+    Returns (is_friend_key, reason) tuple.
+    """
+    # Common patterns for friend/co-op keys (case-insensitive)
+    FRIEND_PATTERNS = [
+        # Generic friend pass indicators
+        'friend pass', 'friends pass', 'friend\'s pass',
+        'guest pass', 'guest key',
+        'extra copy', 'extra key',
+        'co-op pass', 'coop pass', 'co op pass',
+        'multiplayer pass', 'multi-player pass',
+        'buddy pass', 'companion pass',
+        'invite key', 'invitation key',
+        'gift copy', 'giftable copy',
+        'additional copy',
+        'bonus copy',
+        
+        # Specific known games with friend keys
+        'minion masters',  # Known for friend keys
+        'dont starve together',  # Has friend copies
+        'portal 2',  # Has extra copy
+        'serious sam',  # Multiple friend keys
+    ]
+    
+    # Load custom exclusions from file (optional)
+    try:
+        with open("friend_key_exclusions.txt", "r", encoding="utf-8") as f:
+            custom_patterns = [line.strip().lower() for line in f if line.strip() and not line.startswith("#")]
+            FRIEND_PATTERNS.extend(custom_patterns)
+    except FileNotFoundError:
+        pass
+    
+    # Fields to check
+    human_name = key.get('human_name', '').lower()
+    machine_name = key.get('machine_name', '').lower()
+    key_type = key.get('key_type_human_name', '').lower()
+    
+    # Check all fields for patterns
+    for pattern in FRIEND_PATTERNS:
+        if pattern in human_name:
+            return True, f"human_name contains '{pattern}'"
+        if pattern in machine_name:
+            return True, f"machine_name contains '{pattern}'"
+        if pattern in key_type:
+            return True, f"key_type contains '{pattern}'"
+    
+    return False, ""
+
+
+def save_friend_key(key, reason=""):
+    """Save friend/co-op keys to a separate CSV for gifting."""
+    filename = "friend_keys.csv"
+    
+    # Check if we need to write header
+    file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
+    
+    with open(filename, "a", encoding="utf-8-sig", newline='') as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+        if file_needs_header:
+            writer.writerow(["human_name", "redeemed_key_val", "gamekey", "reason"])
+        writer.writerow([
+            key.get('human_name', ''),
+            key.get('redeemed_key_val', 'NOT_REVEALED'),
+            key.get('gamekey', ''),
+            reason
+        ])
+        f.flush()
+
+
 class SecureCookieManager:
     """
     Manages encrypted cookie storage with backward compatibility.
@@ -1489,6 +1560,37 @@ def _redeem_steam(session, key, quiet=False):
 # Removed global files dict - now using context managers for proper file handling
 
 
+def remove_from_errored_csv(gamekey, human_name):
+    """Remove a successfully redeemed key from errored.csv to prevent re-retrying."""
+    errored_file = "errored.csv"
+    if not os.path.exists(errored_file):
+        return
+    
+    try:
+        # Read all entries except the one to remove
+        remaining_entries = []
+        with open(errored_file, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            
+            for row in reader:
+                if len(row) >= 2:
+                    row_gamekey = row[0].strip()
+                    row_name = row[1].strip().lower()
+                    # Keep entry if it doesn't match
+                    if not (row_gamekey == gamekey and row_name == human_name.lower()):
+                        remaining_entries.append(row)
+        
+        # Rewrite file without the removed entry
+        with open(errored_file, "w", encoding="utf-8-sig", newline='') as f:
+            writer = csv.writer(f)
+            if header:
+                writer.writerow(header)
+            writer.writerows(remaining_entries)
+    except Exception as e:
+        print(f"[DEBUG] Failed to remove entry from errored.csv: {e}", file=sys.stderr, flush=True)
+
+
 @contextmanager
 def get_csv_writer(code):
     """Context manager for CSV file writing. Ensures files are properly closed."""
@@ -1510,15 +1612,48 @@ def get_csv_writer(code):
 
 
 def write_key(code, key):
-    """Write key to appropriate CSV file based on redemption result."""
+    """Write key to appropriate CSV file with proper CSV escaping and duplicate prevention."""
     gamekey = key.get('gamekey', '')
-    human_name = key.get('human_name', '').replace(",", ".")
+    human_name = key.get('human_name', '')
     redeemed_key_val = key.get("redeemed_key_val", '')
-    output = f"{gamekey},{human_name},{redeemed_key_val}\n"
     
+    # Determine filename
+    filename = "redeemed.csv"
+    if code == 15 or code == 9:
+        filename = "already_owned.csv"
+    elif code == "EXPIRED":
+        filename = "expired.csv"
+    elif code != 0:
+        filename = "errored.csv"
+    
+    # Check for duplicates in target file before writing
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8-sig") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 2:
+                        existing_gamekey = row[0].strip()
+                        existing_name = row[1].strip().lower()
+                        # Match by both gamekey AND name for accuracy
+                        if existing_gamekey == gamekey and existing_name == human_name.lower():
+                            # Duplicate found - skip writing
+                            # If successfully redeemed but was in errored.csv, remove it
+                            if code in (0, 9, 15):
+                                remove_from_errored_csv(gamekey, human_name)
+                            return
+        except Exception:
+            pass  # If read fails, continue with write
+    
+    # Use csv.writer for proper escaping of special characters
     with get_csv_writer(code) as f:
-        f.write(output)
+        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+        writer.writerow([gamekey, human_name, redeemed_key_val])
         f.flush()
+    
+    # If successfully redeemed, remove from errored.csv
+    if code in (0, 9, 15):  # Success codes (redeemed, already owned, already activated)
+        remove_from_errored_csv(gamekey, human_name)
 
 
 def prompt_skipped(skipped_games):
@@ -2009,9 +2144,17 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     # Query owned App IDs according to Steam
     owned_app_details = get_owned_apps(session)
 
+    # Ask user if they want to skip friend/co-op keys
+    skip_friend_keys = prompt_yes_no(
+        "Would you like to automatically skip friend/co-op keys? "
+        "(These will be saved to friend_keys.csv for gifting)",
+        default_yes=True
+    )
+
     noted_keys = [key for key in humble_keys if key.get("steam_app_id") not in owned_app_details.keys()]
     skipped_games = {}
     unownedgames = []
+    friend_keys_skipped = []  # Track skipped friend keys
 
     # Some Steam keys come back with no Steam AppID from Humble
     # So we do our best to look up from AppIDs (no packages, because can't find an API for it)
@@ -2019,6 +2162,13 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     filter_live = prompt_filter_live() == "y"
 
     for game in noted_keys:
+        # Check if it's a friend/co-op key FIRST
+        if skip_friend_keys:
+            is_friend, reason = is_friend_or_coop_key(game)
+            if is_friend:
+                friend_keys_skipped.append((game, reason))
+                continue  # Skip this key entirely
+        
         best_match = match_ownership(owned_app_details,game,filter_live)
         if best_match[1] is not None and best_match[1] in owned_app_details.keys():
             skipped_games[game['human_name'].strip()] = game
@@ -2030,6 +2180,13 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             len(unownedgames)
         )
     )
+    
+    # Report on friend keys
+    if friend_keys_skipped:
+        print(f"Skipped {len(friend_keys_skipped)} friend/co-op keys (saved to friend_keys.csv)")
+        # Save friend keys for later gifting
+        for key, reason in friend_keys_skipped:
+            save_friend_key(key, reason)
 
     if len(skipped_games):
         # Skipped games uncertain to be owned by user. Let user choose
@@ -2137,6 +2294,9 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         total_wait_minutes = (rate_limit_total_wait_time % 3600) // 60
         print(f"Rate limiting encountered: {rate_limit_count} key(s) hit rate limit")
         print(f"Total wait time: {total_wait_hours}h {total_wait_minutes}m")
+    # Report friend keys if they were skipped
+    if friend_keys_skipped:
+        print(f"Friend/co-op keys saved: {len(friend_keys_skipped)} (see friend_keys.csv)")
     print(f"{'='*60}\n")
     return session
 
@@ -2807,8 +2967,27 @@ The error details have been logged for debugging.
         steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
         total_steam_keys = len(steam_keys)
 
+        # Filter out friend/co-op keys before processing (optional pre-filter)
+        friend_keys_prefiltered = []
+        if prompt_yes_no("Pre-filter friend/co-op keys before processing? (Recommended)", default_yes=True):
+            non_friend_keys = []
+            for key in steam_keys:
+                is_friend, reason = is_friend_or_coop_key(key)
+                if is_friend:
+                    friend_keys_prefiltered.append((key, reason))
+                else:
+                    non_friend_keys.append(key)
+            
+            if friend_keys_prefiltered:
+                print(f"Pre-filtered {len(friend_keys_prefiltered)} friend/co-op keys")
+                # Save them to friend_keys.csv
+                for key, reason in friend_keys_prefiltered:
+                    save_friend_key(key, reason)
+            
+            steam_keys = non_friend_keys
+
         # Load keys that should be excluded (already processed successfully)
-        exclude_filters = ["already_owned.csv", "redeemed.csv", "expired.csv"]
+        exclude_filters = ["already_owned.csv", "redeemed.csv", "expired.csv", "friend_keys.csv"]
         original_length = len(steam_keys)
         for filter_file in exclude_filters:
             try:
@@ -2822,8 +3001,9 @@ The error details have been logged for debugging.
                 print(f"Warning: Error reading {filter_file}: {e}")
         
         # Load problematic keys (from errored.csv) - these will be tried LAST
+        # IMPORTANT: Match by BOTH gamekey AND name to avoid issues with shared gamekeys (Choice months)
         problematic_keys = []
-        problematic_gamekeys = set()  # Track by gamekey (not redeemed_key_val, which may not exist yet)
+        problematic_by_name = set()  # Track by (gamekey, name) for exact matching
         errored_file = "errored.csv"
         if os.path.exists(errored_file):
             try:
@@ -2833,21 +3013,36 @@ The error details have been logged for debugging.
                     first_row = next(reader, None)
                     if first_row and first_row[0].lower() != "gamekey":
                         # First row is data, not header
-                        if len(first_row) >= 1:
-                            problematic_gamekeys.add(first_row[0].strip())
+                        if len(first_row) >= 2:
+                            gamekey = first_row[0].strip()
+                            name = first_row[1].strip().lower()
+                            problematic_by_name.add((gamekey, name))
                     # Read remaining rows
                     for row in reader:
-                        if len(row) >= 1:
-                            problematic_gamekeys.add(row[0].strip())
+                        if len(row) >= 2:
+                            gamekey = row[0].strip()
+                            name = row[1].strip().lower()
+                            problematic_by_name.add((gamekey, name))
             except Exception as e:
                 print(f"Warning: Error reading {errored_file}: {e}")
         
-        # Separate keys into normal and problematic (match by gamekey)
+        # Separate keys into normal and problematic (match by gamekey AND name)
+        # IMPORTANT: Deduplicate problematic_keys to avoid processing the same game multiple times
         normal_keys = []
+        problematic_seen = set()  # Track (gamekey, name) combinations already added
         for key in steam_keys:
             gamekey = key.get("gamekey", "")
-            if gamekey and gamekey in problematic_gamekeys:
-                problematic_keys.append(key)
+            key_name = key.get("human_name", "").strip().lower()
+            
+            # Only mark as problematic if there's an exact match (gamekey + name) in errored.csv
+            # This prevents games with shared gamekeys from being incorrectly marked as problematic
+            if gamekey and (gamekey, key_name) in problematic_by_name:
+                # Deduplicate - only add each (gamekey, name) combination once
+                key_id = (gamekey, key_name)
+                if key_id not in problematic_seen:
+                    problematic_seen.add(key_id)
+                    problematic_keys.append(key)
+                # else: silently skip duplicate
             else:
                 normal_keys.append(key)
         
@@ -2891,7 +3086,10 @@ The error details have been logged for debugging.
             print(f"Retrying {len(problematic_keys)} previously problematic keys (trying last)...")
             print(f"{'='*60}\n")
             # Load the redeemed_key_val from errored.csv for these keys
-            errored_dict = {}
+            # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
+            # IMPORTANT: Deduplicate entries - prefer valid keys over empty/invalid ones
+            errored_dict = {}  # gamekey -> key_val (fallback for games without name match)
+            errored_by_name = {}  # (gamekey, name) -> key_val (preferred - exact match)
             if os.path.exists("errored.csv"):
                 try:
                     with open("errored.csv", "r", encoding="utf-8-sig") as f:
@@ -2899,22 +3097,79 @@ The error details have been logged for debugging.
                         first_row = next(reader, None)
                         if first_row and first_row[0].lower() != "gamekey":
                             if len(first_row) >= 3:
-                                errored_dict[first_row[0].strip()] = first_row[2].strip()
+                                gamekey = first_row[0].strip()
+                                name = first_row[1].strip().lower() if len(first_row) > 1 else ""
+                                key_val = first_row[2].strip()
+                                # Only store if we don't have a better (valid) key already
+                                if name:
+                                    if (gamekey, name) not in errored_by_name or (
+                                        not valid_steam_key(errored_by_name.get((gamekey, name), "")) and 
+                                        valid_steam_key(key_val)
+                                    ):
+                                        errored_by_name[(gamekey, name)] = key_val
+                                if gamekey not in errored_dict or (
+                                    not valid_steam_key(errored_dict.get(gamekey, "")) and 
+                                    valid_steam_key(key_val)
+                                ):
+                                    errored_dict[gamekey] = key_val
                         for row in reader:
                             if len(row) >= 3:
-                                errored_dict[row[0].strip()] = row[2].strip()
+                                gamekey = row[0].strip()
+                                name = row[1].strip().lower() if len(row) > 1 else ""
+                                key_val = row[2].strip()
+                                # Only store if we don't have a better (valid) key already
+                                if name:
+                                    if (gamekey, name) not in errored_by_name or (
+                                        not valid_steam_key(errored_by_name.get((gamekey, name), "")) and 
+                                        valid_steam_key(key_val)
+                                    ):
+                                        errored_by_name[(gamekey, name)] = key_val
+                                if gamekey not in errored_dict or (
+                                    not valid_steam_key(errored_dict.get(gamekey, "")) and 
+                                    valid_steam_key(key_val)
+                                ):
+                                    errored_dict[gamekey] = key_val
                 except Exception as e:
                     print(f"Warning: Error reading errored.csv: {e}")
             
             # Update problematic keys with their redeemed_key_val from errored.csv
+            # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
             keys_to_retry = []
+            seen_keys = set()  # Track by (gamekey, name) to avoid duplicates
+            
             for key in problematic_keys:
                 gamekey = key.get("gamekey", "")
-                if gamekey in errored_dict:
-                    key["redeemed_key_val"] = errored_dict[gamekey]
-                    # Only retry if we have a valid Steam key
-                    if valid_steam_key(key["redeemed_key_val"]):
+                key_name = key.get("human_name", "").strip().lower()
+                
+                # Skip duplicates (same gamekey + name combination)
+                key_id = (gamekey, key_name)
+                if key_id in seen_keys:
+                    continue  # Already processed this exact game
+                seen_keys.add(key_id)
+                
+                # Try to find matching key_val - prefer exact name match
+                key_val = None
+                if (gamekey, key_name) in errored_by_name:
+                    key_val = errored_by_name[(gamekey, key_name)]
+                elif gamekey in errored_dict:
+                    key_val = errored_dict[gamekey]
+                
+                if key_val:
+                    # Validate BEFORE adding to retry list
+                    if not key_val or key_val == "" or key_val == "EXPIRED":
+                        # Empty or expired - skip silently, will be handled by normal flow
+                        continue
+                    elif not valid_steam_key(key_val):
+                        # Invalid key format - skip silently to avoid spam
+                        continue
+                    else:
+                        # Valid key - set it and add to retry list
+                        key["redeemed_key_val"] = key_val
                         keys_to_retry.append(key)
+                else:
+                    # No entry in errored.csv for this specific game - skip silently
+                    # No need to retry if there's no key value in errored.csv
+                    continue
             
             if keys_to_retry:
                 # Retry these keys directly (they already have redeemed_key_val)
@@ -2922,10 +3177,23 @@ The error details have been logged for debugging.
                 for idx, key in enumerate(keys_to_retry, 1):
                     remaining = total_retry - idx + 1
                     print(f"[RETRY {idx}/{total_retry}] {key['human_name']} ({remaining} remaining)")
+                    
+                    # Double-check key validity before attempting
+                    if not valid_steam_key(key["redeemed_key_val"]):
+                        print(f"  -> Invalid key format, skipping")
+                        continue
+                    
                     code = _redeem_steam(steam_session, key["redeemed_key_val"])
+                    
+                    # Rate-limit handling INSIDE the for loop
                     retry_interval = 300  # 5 minutes between retries
                     seconds_waited = 0
+                    rate_limited_this_key = False
+                    
                     while code == 53:
+                        if not rate_limited_this_key:
+                            rate_limited_this_key = True
+                        
                         minutes_waited = seconds_waited // 60
                         next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
                         print(
@@ -2939,8 +3207,12 @@ The error details have been logged for debugging.
                             code = _redeem_steam(steam_session, key["redeemed_key_val"], quiet=True)
                             if code == 53:
                                 print("Still rate limited.")
-                    if code != 53:
-                        print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
+                    
+                    if code != 53 and rate_limited_this_key:
+                        total_wait_minutes = seconds_waited // 60
+                        print(f"\n✓ Rate limit cleared after waiting {total_wait_minutes} minutes! Continuing with {remaining} keys remaining...\n")
+                    
+                    # Write key INSIDE the for loop
                     write_key(code, key)
             else:
                 print("No valid keys found to retry from problematic keys list.")

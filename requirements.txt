@@ -4,3 +4,4 @@ selenium>=4.10.0
 pwinput>=1.0.3
 steam @ git+https://github.com/FailSpy/steam-py-lib@master # patched steam python library using changes from artur1214 until fixed on main repo
 webdriver-manager>=4.0.0 # optional - auto-downloads browser drivers
+cryptography>=41.0.0  # Optional: for encrypted cookie storage (recommended for production)

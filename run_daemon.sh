@@ -528,12 +528,16 @@ run_daemon() {
         
         if command -v timeout &> /dev/null; then
             # Use timeout if available (configurable via env var)
+            log "Starting Python script with ${SCRIPT_TIMEOUT}s timeout..."
             timeout $SCRIPT_TIMEOUT python3 humblesteamkeysredeemer.py --auto 2>&1 | tee -a "$LOG_FILE"
             exit_code=${PIPESTATUS[0]}
+            log "Python script exited with code: $exit_code"
         else
             # No timeout available - run without limit
+            log "Starting Python script (no timeout)..."
             python3 humblesteamkeysredeemer.py --auto 2>&1 | tee -a "$LOG_FILE"
             exit_code=${PIPESTATUS[0]}
+            log "Python script exited with code: $exit_code"
         fi
         
         set -e
