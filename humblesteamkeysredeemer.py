@@ -4372,6 +4372,37 @@ The error details have been logged for debugging.
             print(f"Checking {len(incomplete_months)} Choice months for unselected games...")
             for idx, month in enumerate(incomplete_months, 1):
                 month_name = month.get("product", {}).get("human_name", f"Month {idx}")
+                month_gamekey = month.get("gamekey", "")
+                
+                # OPTIMIZATION: Check if we need to fetch month data at all
+                # Skip fetching if:
+                # 1. There are no unrevealed keys for this month, OR
+                # 2. All unrevealed keys are already selected (in tpkd_dict)
+                chosen_games = set(find_dict_keys(month.get("tpkd_dict", {}), "machine_name"))
+                unrevealed_for_month = [
+                    key for key in unrevealed_keys
+                    if key.get("gamekey", "") == month_gamekey
+                ]
+                
+                # If no unrevealed keys for this month, skip entirely
+                if not unrevealed_for_month:
+                    print(f"  [{idx}/{len(incomplete_months)}] {month_name}... ✓ (no unrevealed keys, skipping)")
+                    continue
+                
+                # Check if all unrevealed keys are already selected
+                all_selected = True
+                for key in unrevealed_for_month:
+                    machine_name = key.get("machine_name", "")
+                    if machine_name and machine_name not in chosen_games:
+                        all_selected = False
+                        break
+                
+                # If all unrevealed keys are already selected, skip fetching month data
+                if all_selected:
+                    print(f"  [{idx}/{len(incomplete_months)}] {month_name}... ✓ (all games selected, skipping)")
+                    continue
+                
+                # Need to fetch month data to check for unselected games
                 try:
                     # Add timeout protection - get_month_data can hang
                     print(f"  [{idx}/{len(incomplete_months)}] Checking {month_name}...", end=" ", flush=True)
@@ -4386,6 +4417,7 @@ The error details have been logged for debugging.
                     if not month["choice_data"].get('canRedeemGames', True):
                         continue
                     
+                    # Refresh chosen_games after fetching data (should be same, but be safe)
                     chosen_games = set(find_dict_keys(month.get("tpkd_dict", {}), "machine_name"))
                     v3 = not month["choice_data"].get("usesChoices", True)
                     
