@@ -98,6 +98,7 @@ Usage: $0 [options]
 
 Options:
   -h, --help        Show this help message
+  -v, --version     Show version information
   -b, --background  Run in background (detached from terminal)
   -s, --stats       Show current statistics
   -t, --status      Show daemon status
@@ -233,6 +234,14 @@ show_log() {
 }
 
 # Rotate log if too large
+# Keeps last N rotations: daemon.log.old.1 through daemon.log.old.N
+# Example with MAX_LOG_ROTATIONS=5:
+#   daemon.log.old.5 (deleted)
+#   daemon.log.old.4 → daemon.log.old.5
+#   daemon.log.old.3 → daemon.log.old.4
+#   daemon.log.old.2 → daemon.log.old.3
+#   daemon.log.old.1 → daemon.log.old.2
+#   daemon.log → daemon.log.old.1
 rotate_log() {
     if [ -f "$LOG_FILE" ]; then
         local size=$(get_file_size "$LOG_FILE")
@@ -443,8 +452,9 @@ check_file_permissions() {
                 # macOS
                 perms=$(stat -f %Lp "$file")
             else
-                # Fallback - use ls
-                perms=$(ls -l "$file" | awk '{print $1}' | sed 's/^...\(...\).*/\1/')
+                # Fallback - cannot reliably get octal permissions from ls
+                warning "$file permissions cannot be verified (stat command not found)"
+                continue
             fi
             
             # Check if permissions are too open (should be 600)
@@ -457,11 +467,19 @@ check_file_permissions() {
 
 # Check disk space
 check_disk_space() {
+    # Try df with different options for portability
     local available
-    if df -k "$SCRIPT_DIR" >/dev/null 2>&1; then
-        available=$(df -k "$SCRIPT_DIR" | tail -1 | awk '{print $4}')
-        if [ "$available" -lt 10240 ]; then  # Less than 10MB
+    if available=$(df -k "$SCRIPT_DIR" 2>/dev/null | tail -1 | awk '{print $4}'); then
+        if [ -n "$available" ] && [ "$available" -lt 10240 ]; then  # Less than 10MB
             warning "Low disk space: ${available}KB available"
+        fi
+    else
+        # Try without -k flag (some systems)
+        if available=$(df "$SCRIPT_DIR" 2>/dev/null | tail -1 | awk '{print $4}'); then
+            # Might be in blocks, best effort warning
+            if [ -n "$available" ] && [ "$available" -lt 20000 ]; then
+                warning "Possibly low disk space (check manually)"
+            fi
         fi
     fi
 }
@@ -553,7 +571,7 @@ monitor_health() {
                 inactive_checks=$((inactive_checks + 1))
                 if [ $inactive_checks -ge $max_inactive_checks ]; then
                     local inactive_time=$((HEALTH_CHECK_INTERVAL * inactive_checks))
-                    log_no_tee "WARNING: No activity for ${inactive_time}s - possible hang"
+                    log_no_tee "WARNING: No activity for ${inactive_time}s - possible hang. Consider checking process or reducing timeout."
                 else
                     log_no_tee "Health check: No log activity in last ${HEALTH_CHECK_INTERVAL}s (may be normal)"
                 fi
@@ -761,12 +779,17 @@ SHOW_STATUS=false
 STOP_DAEMON=false
 RESTART_DAEMON=false
 SHOW_LOG=false
+SHOW_VERSION=false
 LOG_LINES=50
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
             usage
+            ;;
+        -v|--version)
+            SHOW_VERSION=true
+            shift
             ;;
         -b|--background)
             BACKGROUND=true
@@ -806,6 +829,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Version mode - show version and exit
+if [ "$SHOW_VERSION" = true ]; then
+    echo "Humble Steam Key Redeemer Daemon v${VERSION}"
+    exit 0
+fi
 
 # Check prerequisites
 check_prerequisites
@@ -919,8 +948,6 @@ if [ "$BACKGROUND" = true ]; then
     echo "=== Main Log ==="
     [ -f "$LOG_FILE" ] && tail -20 "$LOG_FILE" || echo "(No main log found)"
     exit 1
-    
-    exit 0
 fi
 
 # Run in foreground
