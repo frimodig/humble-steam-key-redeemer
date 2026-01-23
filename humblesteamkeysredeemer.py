@@ -349,6 +349,9 @@ wa.getpass = pwinput
 # Setup proper logging with rotation
 def setup_logging():
     """Setup rotating log handler to prevent unbounded log growth."""
+    # Suppress urllib3 connection pool warnings (too verbose, expected during normal operation)
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+    
     # Create logger
     logger = logging.getLogger('humble_redeemer')
     logger.setLevel(logging.DEBUG)  # Capture all levels
@@ -846,6 +849,11 @@ def process_quit(driver, interrupt_event=None):
         _global_interrupt_event = interrupt_event
     
     def quit_on_exit(signum, frame):
+        # Suppress urllib3 warnings during cleanup (expected when browser is killed)
+        import warnings
+        warnings.filterwarnings('ignore', category=UserWarning, module='urllib3')
+        logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+        
         print("\n\nInterrupted by user (Ctrl+C). Cleaning up...", file=sys.stderr, flush=True)
         # Set interrupt event if available (allows thread to exit gracefully)
         if _global_interrupt_event:
@@ -2202,17 +2210,22 @@ def wait_for_rate_limit_clear(
         Final redemption status code (53 = still rate limited, other = success/failure)
     """
     seconds_waited = 0
+    last_update = 0  # Track last time we updated the display
+    update_interval = 60  # Update display every 60 seconds (reduced verbosity)
     
     while True:
-        minutes_waited = seconds_waited // 60
-        next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
-        print(
-            f"Rate limited. Waited {minutes_waited}m, "
-            f"retrying in {next_retry}m (limit clears in ~1hr) - "
-            f"{remaining} keys remaining   ",
-            end="\r",
-            flush=True
-        )
+        # Only update display every update_interval seconds to reduce spam
+        if seconds_waited - last_update >= update_interval:
+            minutes_waited = seconds_waited // 60
+            next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
+            print(
+                f"Rate limited. Waited {minutes_waited}m, "
+                f"retrying in {next_retry}m (limit clears in ~1hr) - "
+                f"{remaining} keys remaining   ",
+                end="\r",
+                flush=True
+            )
+            last_update = seconds_waited
         
         time.sleep(check_interval)
         seconds_waited += check_interval
@@ -2229,6 +2242,8 @@ def wait_for_rate_limit_clear(
                 print(f"\n✓ Rate limit cleared! Continuing with {remaining} keys remaining...\n")
                 return code
             print("Still rate limited.")
+            # Reset last_update so we show the "Still rate limited" message
+            last_update = seconds_waited
     
     # Note: This function loops until the rate limit clears (code != 53).
     # It will return when Steam accepts the key or another error occurs.
@@ -3921,6 +3936,8 @@ if __name__=="__main__":
                 
                 # Check results
                 if interrupt_event.is_set() or isinstance(exception[0], KeyboardInterrupt):
+                    # Suppress urllib3 warnings during cleanup
+                    logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
                     print("\n\nInterrupted by user (Ctrl+C). Exiting...")
                     # Force kill browser process if driver.quit() doesn't work
                     try:
@@ -4617,6 +4634,8 @@ The error details have been logged for debugging.
         print(f"Ended at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print("="*60)
     except KeyboardInterrupt:
+        # Suppress urllib3 warnings during cleanup
+        logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
         print("\n\nInterrupted by user (Ctrl+C). Exiting...")
         try:
             if driver:
