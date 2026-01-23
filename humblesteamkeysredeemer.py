@@ -2211,17 +2211,16 @@ def wait_for_rate_limit_clear(
     """
     seconds_waited = 0
     last_update = 0  # Track last time we updated the display
-    update_interval = 60  # Update display every 60 seconds (reduced verbosity)
+    update_interval = 300  # Update display every 5 minutes (reduced verbosity for long waits)
     
     while True:
         # Only update display every update_interval seconds to reduce spam
         if seconds_waited - last_update >= update_interval:
             minutes_waited = seconds_waited // 60
             next_retry = (retry_interval - (seconds_waited % retry_interval)) // 60
+            # More concise message
             print(
-                f"Rate limited. Waited {minutes_waited}m, "
-                f"retrying in {next_retry}m (limit clears in ~1hr) - "
-                f"{remaining} keys remaining   ",
+                f"Rate limited ({minutes_waited}m waited, retry in {next_retry}m) - {remaining} keys remaining   ",
                 end="\r",
                 flush=True
             )
@@ -2230,8 +2229,8 @@ def wait_for_rate_limit_clear(
         time.sleep(check_interval)
         seconds_waited += check_interval
         
-        # Keep session alive periodically
-        if keepalive and seconds_waited % 60 == 0:  # Every minute
+        # Keep session alive periodically (less frequently to reduce noise)
+        if keepalive and seconds_waited % 300 == 0:  # Every 5 minutes instead of every minute
             keepalive.check()
         
         # Retry after retry_interval
