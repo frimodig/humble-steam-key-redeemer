@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 import atexit
 import signal
 from http.client import responses
+from http import HTTPStatus
+from typing import Union, Dict, Any, Tuple, Optional
 import argparse
 import csv
 import threading
@@ -33,6 +35,8 @@ from logging.handlers import RotatingFileHandler
 from contextlib import contextmanager
 from pathlib import Path
 import hashlib
+from enum import IntEnum
+import re
 
 # Try to import encryption support
 try:
@@ -57,9 +61,237 @@ except ImportError:
 # Auto mode flag - when True, auto-answers prompts for daemon/unattended operation
 AUTO_MODE = False
 
+
+# Steam redemption error codes (from Steam API responses)
+class SteamErrorCode(IntEnum):
+    """
+    Steam key redemption error codes.
+    
+    Note: EXPIRED is a Humble Bundle-specific code (not a Steam error).
+    Uses negative value (-1) to avoid conflicts with Steam's positive error codes.
+    
+    Example usage:
+        >>> code = SteamErrorCode.SUCCESS
+        >>> write_key(code, key_dict)
+        
+        >>> # String "EXPIRED" is automatically converted
+        >>> write_key("EXPIRED", key_dict)
+    """
+    SUCCESS = 0
+    INVALID_KEY = 14
+    DUPLICATE_KEY = 15
+    ALREADY_OWNED = 9
+    RATE_LIMITED = 53
+    # Humble Bundle specific code - negative to avoid Steam error code conflicts
+    EXPIRED = -1  # Key expired on Humble Bundle (not a Steam error)
+
+
+def normalize_error_code(code: Union[SteamErrorCode, int, str]) -> Union[SteamErrorCode, int]:
+    """
+    Normalize error code to int/IntEnum type for consistent handling.
+    
+    Converts string "EXPIRED" to SteamErrorCode.EXPIRED enum value.
+    This ensures backward compatibility while maintaining type consistency.
+    
+    Args:
+        code: Error code in various formats (SteamErrorCode enum, int, or "EXPIRED" string)
+        
+    Returns:
+        Normalized error code (SteamErrorCode enum or int)
+        
+    Raises:
+        ValueError: If code is invalid type
+        
+    Example:
+        >>> normalize_error_code("EXPIRED")
+        SteamErrorCode.EXPIRED
+        >>> normalize_error_code(SteamErrorCode.SUCCESS)
+        SteamErrorCode.SUCCESS
+        >>> normalize_error_code(0)
+        0
+    """
+    if isinstance(code, str):
+        if code == "EXPIRED":
+            return SteamErrorCode.EXPIRED
+        else:
+            logging.warning(f"Unknown string error code: {code}, treating as generic error")
+            return -2  # Generic error code for unknown string codes
+    elif isinstance(code, (int, IntEnum)):
+        return code
+    else:
+        raise ValueError(f"Invalid code type: {type(code)}, expected SteamErrorCode, int, or str")
+
+
+# Friend key detection confidence thresholds
+FRIEND_KEY_HIGH_CONFIDENCE_THRESHOLD = 0.8
+FRIEND_KEY_LOW_CONFIDENCE_THRESHOLD = 0.5
+
+# Success codes for Steam key redemption (used for cleanup operations)
+SUCCESS_CODES = {
+    SteamErrorCode.SUCCESS,
+    SteamErrorCode.ALREADY_OWNED,
+    SteamErrorCode.DUPLICATE_KEY
+}
+
+# CSV file paths used by the script
+class CSVFiles:
+    """CSV file paths and operations configuration."""
+    # File paths
+    ERRORED = "errored.csv"
+    REDEEMED = "redeemed.csv"
+    ALREADY_OWNED = "already_owned.csv"
+    EXPIRED = "expired.csv"
+    FRIEND_KEYS = "friend_keys.csv"
+    SKIPPED = "skipped.txt"
+    
+    # File operation configuration
+    ENCODING = "utf-8-sig"
+    
+    @classmethod
+    def get_exclusion_filters(cls):
+        """Return list of CSV files used for duplicate filtering."""
+        return [cls.ALREADY_OWNED, cls.REDEEMED, cls.EXPIRED, cls.FRIEND_KEYS]
+
+
+# Mapping from error codes to CSV files for cleaner code organization
+# Defined after CSVFiles class to avoid forward reference errors
+CODE_TO_FILE_MAP = {
+    SteamErrorCode.SUCCESS: CSVFiles.REDEEMED,
+    SteamErrorCode.DUPLICATE_KEY: CSVFiles.ALREADY_OWNED,
+    SteamErrorCode.ALREADY_OWNED: CSVFiles.ALREADY_OWNED,
+    SteamErrorCode.EXPIRED: CSVFiles.EXPIRED,
+}
+
+# CSV encoding constant (for backward compatibility and convenience)
+CSV_ENCODING = CSVFiles.ENCODING
+
+# Compiled regex patterns for better performance (compiled once at module level)
+PLATFORM_SUFFIX_PATTERN = re.compile(r'\s*\(Steam\)\s*$', re.IGNORECASE)
+
+# Windows file locking constants
+# Lock 1 byte at offset 0 - this is the standard practice for file locking on Windows.
+# 
+# Unlike Unix (which locks the whole file with flock), Windows uses byte-range locking.
+# This single byte acts as a lock flag for the entire file on Windows.
+# Locking just 1 byte is standard and sufficient - locking more bytes would waste
+# address space without providing additional synchronization benefits.
+WINDOWS_LOCK_SIZE = 1  # Lock 1 byte at offset 0 (standard practice for file locking)
+
 # Cache directory for storing fetched data
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Cache version - increment when data structure changes to invalidate old caches
+CACHE_VERSION = 1
+
+# Choice month completion tracking file
+CHOICE_COMPLETED_FILE = Path(".choice_completed.json")
+
+def load_completed_choice_months():
+    """
+    Load the set of completed Choice month gamekeys.
+    
+    Returns:
+        Set of gamekeys for Choice months that have been fully processed
+    """
+    if not CHOICE_COMPLETED_FILE.exists():
+        return set()
+    
+    try:
+        with open(CHOICE_COMPLETED_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Support both old format (list) and new format (dict with metadata)
+            if isinstance(data, list):
+                return set(data)
+            elif isinstance(data, dict) and 'completed_months' in data:
+                return set(data['completed_months'])
+            else:
+                return set()
+    except (IOError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        logging.warning(f"Error loading completed Choice months: {e}")
+        return set()
+
+def save_completed_choice_months(completed_months):
+    """
+    Save the set of completed Choice month gamekeys.
+    
+    Args:
+        completed_months: Set of gamekeys for completed months
+    """
+    try:
+        data = {
+            'completed_months': list(completed_months),
+            'last_updated': datetime.now().isoformat(),
+            'version': 1
+        }
+        with open(CHOICE_COMPLETED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except (IOError, OSError, TypeError) as e:
+        logging.error(f"Error saving completed Choice months: {e}")
+
+def is_choice_month_complete(month_gamekey, order_details):
+    """
+    Check if a Choice month is complete (all games selected and all keys redeemed).
+    
+    A month is complete when:
+    1. All games in the month are selected (in tpkd_dict)
+    2. All keys for that month are in redeemed.csv or already_owned.csv
+    
+    Args:
+        month_gamekey: The gamekey of the Choice month
+        order_details: The order details dictionary
+        
+    Returns:
+        True if the month is complete, False otherwise
+    """
+    # Find the month in order_details
+    month = None
+    for order in order_details:
+        if order.get('gamekey') == month_gamekey:
+            month = order
+            break
+    
+    if not month:
+        return False
+    
+    # Check if all games are selected
+    tpkd_dict = month.get('tpkd_dict', {})
+    chosen_games = set(find_dict_keys(tpkd_dict, "machine_name"))
+    
+    # Get all games for this month
+    month_keys = [key for key in find_dict_keys(order_details, "steam_app_id", True) 
+                  if key.get('gamekey') == month_gamekey]
+    
+    if not month_keys:
+        # No keys found for this month - might not be a Choice month
+        return False
+    
+    # Check if all keys are redeemed or already owned
+    redeemed_keys = _get_cached_keys(CSVFiles.REDEEMED)
+    owned_keys = _get_cached_keys(CSVFiles.ALREADY_OWNED)
+    all_keys = redeemed_keys | owned_keys
+    
+    for key in month_keys:
+        gamekey = key.get('gamekey', '')
+        human_name = key.get('human_name', '')
+        if gamekey and human_name:
+            if (gamekey, human_name.lower()) not in all_keys:
+                # At least one key is not redeemed/owned
+                return False
+    
+    # All keys are redeemed/owned - month is complete
+    return True
+
+def mark_choice_month_complete(month_gamekey):
+    """
+    Mark a Choice month as complete.
+    
+    Args:
+        month_gamekey: The gamekey of the Choice month to mark as complete
+    """
+    completed = load_completed_choice_months()
+    completed.add(month_gamekey)
+    save_completed_choice_months(completed)
 
 # ============================================================================
 # Configuration Constants
@@ -101,8 +333,7 @@ LOG_ROTATION_BACKUP_COUNT = 3  # Keep 3 backup log files
 # Browser detection
 BROWSER_DETECTION_TIMEOUT_SECONDS = 5  # Timeout for browser detection
 
-# Legacy constant for backward compatibility
-SCRIPT_TIMEOUT = SCRIPT_TIMEOUT_SECONDS
+# Legacy constant removed - all references now use SCRIPT_TIMEOUT_SECONDS directly
 
 try:
     from webdriver_manager.chrome import ChromeDriverManager
@@ -217,9 +448,7 @@ headers = {
 }
 
 # Script execution timeout (seconds)
-# Legacy constant for backward compatibility - use SCRIPT_TIMEOUT_SECONDS in new code
-# TODO: Remove this after full migration to SCRIPT_TIMEOUT_SECONDS
-SCRIPT_TIMEOUT = SCRIPT_TIMEOUT_SECONDS
+# Duplicate removed - all references now use SCRIPT_TIMEOUT_SECONDS directly
 
 
 def retry_on_session_error(max_retries=3, delay=2):
@@ -290,13 +519,8 @@ def find_dict_keys(node, kv, parent=False):
 
 getHumbleOrders = '''
 var done = arguments[arguments.length - 1];
+var list = arguments[0] || [];  // Get list from arguments (safer than string replacement)
 console.log('[DEBUG] Starting getHumbleOrderDetails');
-var list = '%optional%';
-if (list){
-    list = JSON.parse(list);
-} else {
-    list = [];
-}
 
 // Prevent duplicate callbacks with a flag
 var callbackFired = false;
@@ -451,28 +675,49 @@ getHumbleOrderDetails(list).then(r => {
 });
 '''
 
+# JavaScript fetch command - uses execute_async_script arguments for safe parameter passing
+# This prevents JavaScript injection by passing data directly as arguments instead of string formatting
 fetch_cmd = '''
 var done = arguments[arguments.length - 1];
+var url = arguments[0];
+var csrf = arguments[1];
+var formDataObj = arguments[2];
+
 var formData = new FormData();
-const jsonData = JSON.parse(atob('{formData}'));
+for (const key in formDataObj) {
+    formData.append(key, formDataObj[key]);
+}
 
-for (const key in jsonData) {{
-    formData.append(key,jsonData[key])
-}}
-
-fetch("{url}", {{
-  "headers": {{
-    "csrf-prevention-token": "{csrf}"
-    }},
-  "body": formData,
-  "method": "POST",
-}}).then(r => {{ r.json().then( v=>{{done([r.status,v])}} ) }} );
+fetch(url, {
+    "headers": {
+        "csrf-prevention-token": csrf
+    },
+    "body": formData,
+    "method": "POST",
+}).then(r => {
+    r.json().then(v => {
+        done([r.status, v]);
+    }).catch(err => {
+        done([r.status, {error: err.message}]);
+    });
+}).catch(err => {
+    done([0, {error: err.message}]);
+});
 '''
 
-def perform_post(driver, url, payload, max_retries=3):
+def perform_post(driver: webdriver.Remote, url: str, payload: Dict[str, Any], max_retries: int = 3) -> Tuple[int, Dict[str, Any]]:
     """
     Perform a POST request via JavaScript fetch in the browser.
     Uses exponential backoff and session refresh on retries.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        url: Target URL for the POST request
+        payload: Dictionary of form data to send
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        Tuple of (HTTP status code, JSON response dictionary)
     """
     base_delay = 2
     
@@ -487,13 +732,12 @@ def perform_post(driver, url, payload, max_retries=3):
                 else:
                     raise InvalidSessionIdException("WebDriver session is invalid after retries")
             
-            json_payload = b64encode(json.dumps(payload).encode('utf-8')).decode('ascii')
             csrf = driver.get_cookie('csrf_cookie')
-            csrf = csrf['value'] if csrf is not None else ''
-
-            result = driver.execute_async_script(
-                fetch_cmd.format(formData=json_payload, url=url, csrf=csrf)
-            )
+            csrf_value = csrf['value'] if csrf is not None else ''
+            
+            # Pass data directly as arguments to execute_async_script (prevents JavaScript injection)
+            # This is safer than string formatting because arguments are serialized by Selenium
+            result = driver.execute_async_script(fetch_cmd, url, csrf_value, payload)
             return result
             
         except TimeoutException as e:
@@ -531,7 +775,7 @@ def try_firefox_browser(name, binary_path, exceptions, headless=True):
                 options.binary_location = binary_path
             service = FirefoxService(GeckoDriverManager().install())
             driver = webdriver.Firefox(service=service, options=options)
-            driver.set_script_timeout(SCRIPT_TIMEOUT)  # Set timeout immediately
+            driver.set_script_timeout(SCRIPT_TIMEOUT_SECONDS)  # Set timeout immediately
             driver.set_page_load_timeout(30)
             process_quit(driver)
             return driver
@@ -545,7 +789,7 @@ def try_firefox_browser(name, binary_path, exceptions, headless=True):
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Firefox(options=options)
-        driver.set_script_timeout(SCRIPT_TIMEOUT)  # Set timeout immediately
+        driver.set_script_timeout(SCRIPT_TIMEOUT_SECONDS)  # Set timeout immediately
         driver.set_page_load_timeout(30)
         process_quit(driver)
         return driver
@@ -594,7 +838,7 @@ def process_quit(driver, interrupt_event=None):
         
         # Exit with code 130 for SIGINT (Ctrl+C), 143 for SIGTERM
         exit_code = 130 if signum == signal.SIGINT else 143
-        os._exit(exit_code)  # Use os._exit to force immediate exit
+        sys.exit(exit_code)  # Use sys.exit to allow proper cleanup (finally blocks, atexit handlers)
     
     def quit_on_exit_atexit():
         try:
@@ -711,7 +955,7 @@ def try_chromium_browser(name, binary_path, exceptions, headless=True):
             
             service = ChromeService(ChromeDriverManager(chrome_type=chrome_type).install())
             driver = webdriver.Chrome(service=service, options=options)
-            driver.set_script_timeout(SCRIPT_TIMEOUT)
+            driver.set_script_timeout(SCRIPT_TIMEOUT_SECONDS)
             driver.set_page_load_timeout(30)
             process_quit(driver)
             return driver
@@ -733,7 +977,7 @@ def try_chromium_browser(name, binary_path, exceptions, headless=True):
         if binary_path:
             options.binary_location = binary_path
         driver = webdriver.Chrome(options=options)
-        driver.set_script_timeout(SCRIPT_TIMEOUT)
+        driver.set_script_timeout(SCRIPT_TIMEOUT_SECONDS)
         driver.set_page_load_timeout(30)
         process_quit(driver)
         return driver
@@ -1015,7 +1259,7 @@ def is_friend_or_coop_key(key, confidence_threshold=0.8):
 
 def save_friend_key(key, reason="", confidence=1.0):
     """Save friend/co-op keys to a separate CSV for gifting with enhanced metadata."""
-    filename = "friend_keys.csv"
+    filename = CSVFiles.FRIEND_KEYS
     
     # Check if we need to write header
     file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
@@ -1359,10 +1603,19 @@ def verify_logins_session(session):
             print(f"[DEBUG] Error verifying login: {e}")
             return [False, False]
 
-def do_login(driver,payload):
-    """Perform login POST request via browser."""
+def do_login(driver: webdriver.Remote, payload: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+    """
+    Perform login POST request via browser.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        payload: Login payload dictionary with username, password, etc.
+    
+    Returns:
+        Tuple of (HTTP status code, JSON response dictionary)
+    """
     auth,login_json = perform_post(driver,HUMBLE_LOGIN_API,payload)
-    if auth not in (200,401):
+    if auth not in (HTTPStatus.OK, HTTPStatus.UNAUTHORIZED):
         print(f"humblebundle.com has responded with an error (HTTP status code {auth}: {responses.get(auth, 'Unknown')}).")
         time.sleep(VERY_LONG_SLEEP_SECONDS)
         sys.exit(1)
@@ -1465,7 +1718,7 @@ def humble_login(driver, is_headless=True):
             continue
 
         # Check if login succeeded without 2FA
-        if auth == 200 and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
+        if auth == HTTPStatus.OK and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
             authorized = True
             break
 
@@ -1502,7 +1755,7 @@ def humble_login(driver, is_headless=True):
                     break
                 
                 # Check for success
-                if auth == 200 and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
+                if auth == HTTPStatus.OK and "two_factor_required" not in login_json and "humble_guard_required" not in login_json:
                     authorized = True
                     break
                     
@@ -1620,10 +1873,18 @@ def steam_login():
         sys.exit(1)
 
 
-def redeem_humble_key(sess, tpk, max_retries=3):
+def redeem_humble_key(sess: webdriver.Remote, tpk: Dict[str, Any], max_retries: int = 3) -> str:
     """
     Redeem a key on Humble Bundle to reveal the actual Steam key.
-    Returns the revealed key, "EXPIRED" for expired keys, or empty string on error.
+    
+    Args:
+        sess: Selenium WebDriver instance (browser session)
+        tpk: Key dictionary containing gamekey, machine_name, human_name, etc.
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        Revealed Steam key string, "EXPIRED" string for expired keys (converted to enum in write_key),
+        or empty string on error
     """
     payload = {
         "keytype": tpk["machine_name"], 
@@ -1659,9 +1920,9 @@ def redeem_humble_key(sess, tpk, max_retries=3):
                 error_msg = respjson.get("error_msg", "Unknown error")
                 print(f"  -> Error redeeming key: {error_msg}")
                 
-                # Check for expired key
+                # Check for expired key - return as string, will be converted to enum in write_key
                 if "expired" in error_msg.lower():
-                    return "EXPIRED"
+                    return "EXPIRED"  # String value, converted to SteamErrorCode.EXPIRED in write_key()
                 
                 # Don't retry on explicit errors from Humble
                 return ""
@@ -1681,8 +1942,10 @@ def redeem_humble_key(sess, tpk, max_retries=3):
             
         except (InvalidSessionIdException, NoSuchWindowException):
             print(f"  -> Session invalid (attempt {attempt + 1}/{max_retries})")
+            # Don't try to recover here - let the caller handle it
+            # This exception will propagate up to redeem_steam_keys() which has better recovery logic
             if attempt < max_retries - 1:
-                # Try to recover
+                # Try simple refresh as last resort
                 print(f"  -> Attempting to recover session...")
                 try:
                     sess.get("https://www.humblebundle.com/home/library")
@@ -1690,6 +1953,7 @@ def redeem_humble_key(sess, tpk, max_retries=3):
                 except:
                     pass
                 continue
+            # Return empty string to indicate failure - caller will handle recovery
             return ""
             
         except Exception as e:
@@ -1704,11 +1968,12 @@ def redeem_humble_key(sess, tpk, max_retries=3):
     
     return ""
 
-def get_month_data(humble_session,month):
+def get_month_data(humble_session, month, timeout=10):
     """Fetch Humble Choice month data. Needs a requests session, not WebDriver."""
     if type(humble_session) is not requests.Session:
         raise Exception("get_month_data needs a configured requests session")
-    r = humble_session.get(HUMBLE_SUB_PAGE + month["product"]["choice_url"])
+    # Add timeout to prevent hanging
+    r = humble_session.get(HUMBLE_SUB_PAGE + month["product"]["choice_url"], timeout=timeout)
 
     data_indicator = f'<script id="webpack-monthly-product-data" type="application/json">'
     jsondata = r.text.split(data_indicator)[1].split("</script>")[0].strip()
@@ -1846,7 +2111,7 @@ def _redeem_steam(session, key, quiet=False):
 
 def remove_from_errored_csv(gamekey, human_name):
     """Remove a successfully redeemed key from errored.csv to prevent re-retrying."""
-    errored_file = "errored.csv"
+    errored_file = CSVFiles.ERRORED
     if not os.path.exists(errored_file):
         return
     
@@ -1929,35 +2194,39 @@ def wait_for_rate_limit_clear(
                 return code
             print("Still rate limited.")
     
-    return 53  # Should never reach here
+    # Note: This function loops until the rate limit clears (code != 53).
+    # It will return when Steam accepts the key or another error occurs.
 
 
 @contextmanager
-def get_csv_writer(code):
+def get_csv_writer(code: Union[SteamErrorCode, int, str]):
     """
-    Context manager for thread-safe CSV file writing with file locking.
+    Context manager for CSV file writing with file locking.
     
-    Ensures files are properly closed and prevents corruption in concurrent scenarios.
-    Uses fcntl (Unix) or msvcrt (Windows) for file locking.
+    Ensures files are properly closed and prevents corruption when multiple
+    processes write to the same file concurrently. Uses fcntl (Unix) or 
+    msvcrt (Windows) for file locking.
+    
+    Note: This protects against multi-process races. For multi-threading
+    within a single process, Python's GIL provides thread safety for the
+    Python-level operations (cache checks, dict updates).
     
     Args:
-        code: Redemption status code (determines target CSV file)
+        code: Redemption status code (SteamErrorCode enum, int, or "EXPIRED" string for backward compatibility)
     
     Yields:
         File handle for CSV writing
     """
-    filename = "redeemed.csv"
-    if code == 15 or code == 9:
-        filename = "already_owned.csv"
-    elif code == "EXPIRED":
-        filename = "expired.csv"
-    elif code != 0:
-        filename = "errored.csv"
+    # Normalize code to ensure consistent handling
+    code = normalize_error_code(code)
+    
+    # Determine filename using mapping (cleaner than if/elif chain)
+    filename = CODE_TO_FILE_MAP.get(code, CSVFiles.ERRORED)
     
     # Check if we need to write header
     file_needs_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
     
-    f = open(filename, "a", encoding="utf-8-sig", newline='')
+    f = open(filename, "a", encoding=CSV_ENCODING, newline='')
     lock_acquired = False
     
     try:
@@ -1967,20 +2236,18 @@ def get_csv_writer(code):
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             lock_acquired = True
         elif HAS_MSVCRT:
-            # Windows: byte-range locking - lock entire file (up to 2GB)
-            # Use non-blocking lock with retry mechanism
+            # Windows: byte-range locking - lock 1 byte at offset 0 (standard practice)
+            # This is sufficient for preventing concurrent access and avoids wasting address space
             max_retries = 5
-            lock_size = 2147483647  # Lock up to 2GB (effectively entire file)
-            
             for attempt in range(max_retries):
                 try:
-                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, lock_size)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, WINDOWS_LOCK_SIZE)
                     lock_acquired = True
                     break
                 except IOError as e:
                     if attempt == max_retries - 1:
                         # Last attempt failed - log but continue (better than failing completely)
-                        print(f"[WARNING] Could not acquire file lock for {filename}: {e}", file=sys.stderr, flush=True)
+                        logging.warning(f"Could not acquire file lock for {filename}: {e}")
                         break
                     time.sleep(0.1)  # Wait 100ms before retry
         
@@ -1997,7 +2264,8 @@ def get_csv_writer(code):
                 if HAS_FCNTL:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
                 elif HAS_MSVCRT:
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 2147483647)
+                    # Unlock using same size as lock (1 byte)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, WINDOWS_LOCK_SIZE)
             except (OSError, IOError):
                 pass  # Ignore unlock errors (file may already be closed)
         
@@ -2007,48 +2275,154 @@ def get_csv_writer(code):
             pass  # Ignore close errors
 
 
-def write_key(code, key):
-    """Write key to appropriate CSV file with proper CSV escaping and duplicate prevention."""
+# Global cache for existing keys to avoid O(n²) duplicate checking
+# Loaded once at startup and updated as keys are written
+# Thread-safe with locking to prevent race conditions in multi-threaded scenarios
+_EXISTING_KEYS_CACHE = {}
+_CACHE_INITIALIZED = False
+_CACHE_LOCK = threading.Lock()  # Thread lock for cache operations
+
+def _initialize_keys_cache():
+    """Initialize the existing keys cache by loading all CSV files once."""
+    global _CACHE_INITIALIZED, _EXISTING_KEYS_CACHE
+    with _CACHE_LOCK:
+        if _CACHE_INITIALIZED:
+            return
+        
+        _EXISTING_KEYS_CACHE[CSVFiles.REDEEMED] = get_existing_keys(CSVFiles.REDEEMED)
+        _EXISTING_KEYS_CACHE[CSVFiles.ALREADY_OWNED] = get_existing_keys(CSVFiles.ALREADY_OWNED)
+        _EXISTING_KEYS_CACHE[CSVFiles.EXPIRED] = get_existing_keys(CSVFiles.EXPIRED)
+        _EXISTING_KEYS_CACHE[CSVFiles.ERRORED] = get_existing_keys(CSVFiles.ERRORED)
+        _CACHE_INITIALIZED = True
+
+def _get_cached_keys(filename):
+    """
+    Get cached keys for a filename, initializing cache if needed.
+    
+    Returns a copy of the cached set to prevent external modifications
+    from affecting the cache. This ensures thread-safety and prevents
+    accidental cache corruption.
+    
+    Args:
+        filename: CSV file path to get cached keys for
+        
+    Returns:
+        Set of (gamekey, name_lower) tuples (copy of cached set)
+    """
+    # Ensure cache is initialized (with lock protection)
+    if not _CACHE_INITIALIZED:
+        _initialize_keys_cache()
+    
+    # Return copy to prevent external modification
+    with _CACHE_LOCK:
+        return _EXISTING_KEYS_CACHE.get(filename, set()).copy()
+
+def _update_keys_cache(filename, gamekey, human_name):
+    """Update the cache after writing a new key. Thread-safe."""
+    with _CACHE_LOCK:
+        if filename in _EXISTING_KEYS_CACHE and _EXISTING_KEYS_CACHE[filename] is not None:
+            _EXISTING_KEYS_CACHE[filename].add((gamekey, human_name.lower()))
+
+def get_existing_keys(filename):
+    """
+    Return set of (gamekey, name_lower) tuples from CSV file.
+    
+    Args:
+        filename: Path to CSV file
+        
+    Returns:
+        Set of (gamekey, name_lower) tuples representing existing keys
+    """
+    if not os.path.exists(filename):
+        return set()
+    
+    keys = set()
+    try:
+        with open(filename, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 2:
+                    gamekey = row[0].strip()
+                    name = row[1].strip().lower()
+                    if gamekey and name:
+                        keys.add((gamekey, name))
+    except Exception as e:
+        logging.error(f"Error reading {filename} for deduplication: {e}")
+    
+    return keys
+
+
+def is_duplicate(gamekey, human_name, existing_keys):
+    """
+    Check if key already exists in the set of existing keys.
+    
+    Args:
+        gamekey: Game key identifier
+        human_name: Human-readable game name
+        existing_keys: Set of (gamekey, name_lower) tuples
+        
+    Returns:
+        True if duplicate found, False otherwise
+    """
+    return (gamekey, human_name.lower()) in existing_keys
+
+
+def write_key(code: Union[SteamErrorCode, int, str], key: Dict[str, Any]) -> None:
+    """
+    Write key to appropriate CSV file with proper CSV escaping and duplicate prevention.
+    
+    Args:
+        code: Redemption status code (SteamErrorCode enum, int, or "EXPIRED" string for backward compatibility)
+        key: Dictionary containing key data with keys: gamekey, human_name, redeemed_key_val
+    
+    Example:
+        >>> write_key(SteamErrorCode.SUCCESS, {"gamekey": "abc123", "human_name": "Test Game", "redeemed_key_val": "XXXXX-XXXXX-XXXXX"})
+        >>> write_key("EXPIRED", {"gamekey": "xyz789", "human_name": "Expired Game"})  # String automatically converted
+    """
+    # Normalize code to ensure consistent handling
+    code = normalize_error_code(code)
+    
     gamekey = key.get('gamekey', '')
     human_name = key.get('human_name', '')
     redeemed_key_val = key.get("redeemed_key_val", '')
     
-    # Determine filename
-    filename = "redeemed.csv"
-    if code == 15 or code == 9:
-        filename = "already_owned.csv"
-    elif code == "EXPIRED":
-        filename = "expired.csv"
-    elif code != 0:
-        filename = "errored.csv"
-    
-    # Check for duplicates in target file before writing
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) >= 2:
-                        existing_gamekey = row[0].strip()
-                        existing_name = row[1].strip().lower()
-                        # Match by both gamekey AND name for accuracy
-                        if existing_gamekey == gamekey and existing_name == human_name.lower():
-                            # Duplicate found - skip writing
-                            # If successfully redeemed but was in errored.csv, remove it
-                            if code in (0, 9, 15):
-                                remove_from_errored_csv(gamekey, human_name)
-                            return
-        except Exception:
-            pass  # If read fails, continue with write
+    # Determine filename using mapping (cleaner than if/elif chain)
+    filename = CODE_TO_FILE_MAP.get(code, CSVFiles.ERRORED)
     
     # Use csv.writer for proper escaping of special characters
+    # CRITICAL: Check for duplicates INSIDE the lock to prevent race conditions
+    # Use cached keys for O(1) lookup instead of reading file each time (O(n²) -> O(n))
     with get_csv_writer(code) as f:
+        # Check cache first (fast O(1) lookup)
+        cached_keys = _get_cached_keys(filename)
+        if is_duplicate(gamekey, human_name, cached_keys):
+            # Duplicate found - skip writing
+            # If successfully redeemed but was in errored.csv, remove it
+            if code in SUCCESS_CODES:
+                remove_from_errored_csv(gamekey, human_name)
+            return
+        
+        # Double-check by reading file while holding lock (prevents race condition with other processes)
+        # This is still O(n) but only happens once per write, and we have the cache for fast checks
+        existing_keys = get_existing_keys(filename)
+        if is_duplicate(gamekey, human_name, existing_keys):
+            # Duplicate found by another process - update cache and skip
+            # Use lock to ensure thread-safe cache update
+            with _CACHE_LOCK:
+                _EXISTING_KEYS_CACHE[filename] = existing_keys
+            if code in SUCCESS_CODES:
+                remove_from_errored_csv(gamekey, human_name)
+            return
+        
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         writer.writerow([gamekey, human_name, redeemed_key_val])
         f.flush()
+        
+        # Update cache after successful write
+        _update_keys_cache(filename, gamekey, human_name)
     
     # If successfully redeemed, remove from errored.csv
-    if code in (0, 9, 15):  # Success codes (redeemed, already owned, already activated)
+    if code in SUCCESS_CODES:  # Success codes (redeemed, already owned, already activated)
         remove_from_errored_csv(gamekey, human_name)
 
 
@@ -2118,8 +2492,17 @@ def prompt_yes_no(question, default_yes=True):
             return True if ans == "y" else False
 
 
-def _load_cache(cache_key, max_age_hours=24):
-    """Load cached data if it exists and is not expired. Returns (data, is_valid) tuple."""
+def _load_cache(cache_key: str, max_age_hours: int = 24) -> Tuple[Optional[Any], bool]:
+    """
+    Load cached data if it exists, is not expired, and version matches.
+    
+    Args:
+        cache_key: Cache key identifier
+        max_age_hours: Maximum age in hours before cache is considered expired
+        
+    Returns:
+        Tuple of (cached_data, is_valid). Returns (None, False) if cache is invalid/expired.
+    """
     cache_file = CACHE_DIR / f"{cache_key}.json"
     if not cache_file.exists():
         return None, False
@@ -2127,6 +2510,12 @@ def _load_cache(cache_key, max_age_hours=24):
     try:
         with cache_file.open("r", encoding="utf-8") as f:
             cache_data = json.load(f)
+        
+        # Version check - invalidate cache if version mismatch
+        cache_version = cache_data.get("version", 1)
+        if cache_version != CACHE_VERSION:
+            logging.info(f"Cache version mismatch for {cache_key} (got {cache_version}, expected {CACHE_VERSION}), invalidating")
+            return None, False
         
         # Check expiration
         cached_time = datetime.fromisoformat(cache_data.get("cached_at", ""))
@@ -2136,15 +2525,25 @@ def _load_cache(cache_key, max_age_hours=24):
         
         return cache_data.get("data"), True
     except (json.JSONDecodeError, ValueError, KeyError, OSError) as e:
-        print(f"[DEBUG] Cache load error for {cache_key}: {e}")
+        logging.debug(f"Cache load error for {cache_key}: {e}")
         return None, False
 
 
-def _save_cache(cache_key, data):
-    """Save data to cache with timestamp."""
+def _save_cache(cache_key: str, data: Any) -> bool:
+    """
+    Save data to cache with version tracking and timestamp.
+    
+    Args:
+        cache_key: Cache key identifier
+        data: Data to cache (must be JSON-serializable)
+        
+    Returns:
+        True if cache was saved successfully, False otherwise
+    """
     cache_file = CACHE_DIR / f"{cache_key}.json"
     try:
         cache_data = {
+            "version": CACHE_VERSION,
             "cached_at": datetime.now().isoformat(),
             "data": data
         }
@@ -2152,12 +2551,22 @@ def _save_cache(cache_key, data):
             json.dump(cache_data, f, indent=2)
         return True
     except (OSError, TypeError) as e:
-        print(f"[DEBUG] Cache save error for {cache_key}: {e}")
+        logging.debug(f"Cache save error for {cache_key}: {e}")
         return False
 
 
-def _load_steam_api_key(path="steam_api_key.txt"):
-    """Load Steam API key from file or prompt user."""
+def _load_steam_api_key(path: str = "steam_api_key.txt") -> str:
+    """
+    Load Steam API key from file or prompt user.
+    
+    Note: Currently stores key in plaintext. Consider encrypting for production use.
+    
+    Args:
+        path: Path to the Steam API key file
+        
+    Returns:
+        Steam API key string
+    """
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -2365,20 +2774,91 @@ def get_owned_apps(steam_session):
     return owned_app_details
 
 
+def _strip_platform_suffixes(name):
+    """
+    Strip Steam platform suffix from game names (e.g., "(Steam)").
+    Returns the name without the Steam suffix.
+    
+    IMPORTANT: 
+    - Only strips "(Steam)" suffix in parentheses at the END of the name
+    - This preserves game names that contain "Steam" as part of the actual title
+      (e.g., "SteamWorld Dig" remains unchanged, but "SteamWorld Dig (Steam)" becomes "SteamWorld Dig")
+    - We only strip "(Steam)" because this script only processes Steam keys.
+      Other platform suffixes (Epic Games, GOG, etc.) are not stripped because:
+      a) Keys with those suffixes won't have steam_app_id and won't be processed
+      b) If they somehow do have steam_app_id, the suffix might be meaningful
+    """
+    # Only strip "(Steam)" suffix - we only process Steam keys, so other platform suffixes
+    # shouldn't appear in our processing pipeline. If they do, we preserve them.
+    # Compile regex once at module level for better performance
+    return PLATFORM_SUFFIX_PATTERN.sub('', name).strip()
+
+
+def _extract_version_numbers(name):
+    """
+    Extract version numbers (both Arabic and Roman numerals) from a game name.
+    Returns a tuple of (name_without_version, version_numbers_list).
+    """
+    # Pattern for Arabic numerals (1, 2, 3, etc.) and Roman numerals (I, II, III, IV, etc.)
+    # Match at word boundaries to avoid matching years (e.g., "2024")
+    version_pattern = r'\b([IVX]+|\d+)\b'
+    
+    # Find all potential version numbers
+    versions = re.findall(version_pattern, name, re.IGNORECASE)
+    
+    # Filter out common false positives (years, single digits that are likely not versions)
+    # Keep Roman numerals and numbers that are likely versions (2+ digits or Roman)
+    filtered_versions = []
+    for v in versions:
+        v_upper = v.upper()
+        # Keep Roman numerals (I, II, III, IV, V, etc.)
+        if re.match(r'^[IVX]+$', v_upper):
+            filtered_versions.append(v_upper)
+        # Keep Arabic numerals that are likely versions (not years, not single digits in common contexts)
+        elif v.isdigit():
+            num = int(v)
+            # Exclude years (1900-2100) and very small numbers that might be part of titles
+            if not (1900 <= num <= 2100) and (num >= 2 or len(v) >= 2):
+                filtered_versions.append(v)
+    
+    # Remove version numbers from name for comparison
+    name_clean = name
+    for version in filtered_versions:
+        # Remove version with word boundaries
+        name_clean = re.sub(r'\b' + re.escape(version) + r'\b', '', name_clean, flags=re.IGNORECASE)
+    
+    # Clean up extra spaces
+    name_clean = re.sub(r'\s+', ' ', name_clean).strip()
+    
+    return name_clean, filtered_versions
+
+
 def match_ownership(owned_app_details, game, filter_live):
     """
     Check if a game matches any owned Steam apps.
     Returns (match_score, appid) tuple.
+    
+    Special handling:
+    - Steam platform suffix: stripped before comparison (e.g., "Balatro (Steam)" matches "Balatro")
+    - Version numbers: if games differ only by version number, they are NOT considered matches
+      (to avoid false positives like "Warhammer II" vs "Warhammer III")
     """
     threshold = 70
     best_match = (0, None)
+    game_name = game['human_name']
+    
+    # Strip Steam platform suffix from game name (e.g., "(Steam)")
+    # Note: We only strip "(Steam)" since we only process Steam keys
+    game_name_clean = _strip_platform_suffixes(game_name)
+    
     # Do a string search based on product names.
+    # Also strip Steam platform suffix from owned app names for fair comparison
     matches = [
-        (fuzz.token_set_ratio(appname, game['human_name']), appid)
+        (fuzz.token_set_ratio(_strip_platform_suffixes(appname), game_name_clean), appid)
         for appid, appname in owned_app_details.items()
     ]
     refined_matches = [
-        (fuzz.token_sort_ratio(owned_app_details[appid], game['human_name']), appid)
+        (fuzz.token_sort_ratio(_strip_platform_suffixes(owned_app_details[appid]), game_name_clean), appid)
         for score, appid in matches
         if score > threshold
     ]
@@ -2387,20 +2867,45 @@ def match_ownership(owned_app_details, game, filter_live):
         best_match = max(refined_matches, key=lambda item: item[0])
         if best_match[0] == 100:
             return best_match
-        print(f"Steam games you own that might match '{game['human_name']}':")
+        print(f"Steam games you own that might match '{game_name}':")
         for match in refined_matches:
             print(f"     {owned_app_details[match[1]]}: {match[0]}")
-        if prompt_yes_no(f"Is \"{game['human_name']}\" in the above list?", default_yes=False):
+        if prompt_yes_no(f"Is \"{game_name}\" in the above list?", default_yes=False):
             return refined_matches[0]
         else:
-            return (0,None)
+            return (0, None)
     else:
+        # Non-interactive mode: use stricter threshold and version-aware matching
+        # game_name_clean already has Steam platform suffix stripped above
+        
+        # Extract version numbers from the game name (after platform stripping)
+        game_name_for_version, game_versions = _extract_version_numbers(game_name_clean)
+        
         if len(refined_matches) > 0:
             best_match = max(refined_matches, key=lambda item: item[0])
         elif len(refined_matches) == 1:
             best_match = refined_matches[0]
-        if best_match[0] < 35:
-            best_match = (0,None)
+        
+        # Special handling: if games differ only by version number, don't match
+        if best_match[1] is not None and game_versions:
+            owned_name = owned_app_details[best_match[1]]
+            # Strip Steam platform suffix before version extraction
+            owned_name_no_platform = _strip_platform_suffixes(owned_name)
+            owned_name_clean, owned_versions = _extract_version_numbers(owned_name_no_platform)
+            
+            # If the base names (without versions) match very closely, but versions differ
+            # This is likely a different version of the same game - don't match
+            base_name_similarity = fuzz.token_sort_ratio(game_name_for_version, owned_name_clean)
+            if base_name_similarity >= 85:  # Base names are very similar
+                if game_versions != owned_versions:  # But versions differ
+                    # Different version - don't match (unless it's a 100% exact match)
+                    if best_match[0] < 100:
+                        return (0, None)
+        
+        # Use 90% threshold for non-interactive mode (was 35% - too low, then 70%)
+        # Only mark as owned if we're very confident (>90% match)
+        if best_match[0] < 90:
+            best_match = (0, None)
     return best_match
 
 
@@ -2427,7 +2932,7 @@ def retry_errored_keys(humble_session, steam_session, order_details):
     """Retry keys that previously errored (especially rate-limited ones)."""
     if order_details is None:
         return  # Can't retry without order details
-    errored_file = "errored.csv"
+    errored_file = CSVFiles.ERRORED
     if not os.path.exists(errored_file):
         return
     # Read errored keys with deduplication - prefer valid keys over empty/invalid ones
@@ -2455,7 +2960,7 @@ def retry_errored_keys(humble_session, steam_session, order_details):
                             'human_name': human_name,
                             "redeemed_key_val": redeemed_key_val
                         }
-            # Read remaining rows
+            # Read remaining rows using the same deduplication logic
             for row in reader:
                 if len(row) >= 3:
                     gamekey = row[0].strip()
@@ -2552,7 +3057,7 @@ def retry_errored_keys(humble_session, steam_session, order_details):
             print(f"  -> Invalid key format, skipping")
             continue
         code = _redeem_steam(steam_session, key["redeemed_key_val"])
-        if code == 53:
+        if code == SteamErrorCode.RATE_LIMITED:
             # Use reusable rate limit handler
             code = wait_for_rate_limit_clear(
                 steam_session,
@@ -2597,6 +3102,84 @@ class SessionKeepAlive:
         self.enabled = False
 
 
+def _reinitialize_browser_session(humble_session, remaining_keys, current_idx, total_keys):
+    """
+    Attempt to reinitialize the browser session when it has died.
+    Returns (new_driver, keepalive) on success, or None on failure.
+    On failure, marks remaining keys as errored and exits.
+    """
+    print(f"\n{'='*60}")
+    print("CRITICAL: Browser session has died and cannot be recovered")
+    print(f"{'='*60}")
+    print(f"\nThe browser session became invalid after multiple consecutive failures.")
+    print("Attempting to reinitialize the browser...")
+    
+    try:
+        # Try to quit the old driver gracefully
+        try:
+            humble_session.quit()
+        except:
+            pass
+        
+        # Create new browser and login
+        print("Creating new browser session...", end=" ", flush=True)
+        new_driver = get_browser_driver(headless=AUTO_MODE)
+        print("OK")
+        
+        print("Re-authenticating with Humble...", end=" ", flush=True)
+        new_driver, login_success = humble_login(new_driver, is_headless=AUTO_MODE)
+        
+        if not login_success:
+            raise Exception("Login failed")
+        
+        # Verify the new session
+        is_valid = verify_logins_session(new_driver)[0]
+        if not is_valid:
+            raise Exception("Session verification failed")
+        
+        print("OK")
+        print(f"\n✓ Browser session successfully reinitialized!")
+        print(f"Continuing with {remaining_keys} keys remaining...\n")
+        
+        # Create new keep-alive
+        new_keepalive = SessionKeepAlive(new_driver, interval=300)
+        
+        return new_driver, new_keepalive
+        
+    except Exception as e:
+        print("FAILED")
+        print(f"\nError reinitializing browser: {e}")
+        print(f"\n{'='*60}")
+        print("CANNOT CONTINUE - Browser session recovery failed")
+        print(f"{'='*60}")
+        print(f"\nProcessed {current_idx - 1} of {total_keys} keys before session failure.")
+        print(f"Remaining keys have been marked as errored and will be retried on next run.")
+        print(f"\nPossible causes:")
+        print("  1. Browser crashed or was killed")
+        print("  2. Network connectivity issues")
+        print("  3. Humble Bundle website is blocking automated access")
+        print("  4. Cookies expired and re-login failed")
+        
+        if AUTO_MODE:
+            print(f"\nIn AUTO_MODE, manual intervention is required:")
+            print("  1. Run: python3 humblesteamkeysredeemer.py")
+            print("  2. Complete the login process")
+            print("  3. Restart the daemon")
+        else:
+            print(f"\nPlease check your connection and try running the script again.")
+        
+        # Mark remaining keys as errored (we need to get them from the caller)
+        # This will be handled by the caller
+        
+        # Clean up
+        try:
+            humble_session.quit()
+        except:
+            pass
+        
+        return None, None
+
+
 def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     """Main function to redeem Steam keys. Returns Steam session for retries."""
     session = steam_login()
@@ -2631,7 +3214,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             is_friend, reason, confidence = is_friend_or_coop_key(key)
             if is_friend:
                 # High confidence (>= 0.8) - automatically skip
-                if confidence >= 0.8:
+                if confidence >= FRIEND_KEY_HIGH_CONFIDENCE_THRESHOLD:
                     friend_keys_skipped.append((key, reason, confidence))
                     continue  # Skip this key entirely
                 else:
@@ -2686,7 +3269,7 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         print(f"\nSkipped {len(friend_keys_skipped)} friend/co-op keys (saved to friend_keys.csv):")
         # Show first 3 examples
         for i, (key, reason, confidence) in enumerate(friend_keys_skipped[:3]):
-            conf_emoji = "🔒" if confidence >= 0.8 else "❓"
+            conf_emoji = "🔒" if confidence >= FRIEND_KEY_HIGH_CONFIDENCE_THRESHOLD else "❓"
             print(f"  {conf_emoji} {key['human_name']} ({reason})")
         if len(friend_keys_skipped) > 3:
             print(f"  ... and {len(friend_keys_skipped) - 3} more (see friend_keys.csv)")
@@ -2712,6 +3295,12 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     # Track rate limiting statistics
     rate_limit_count = 0
     rate_limit_total_wait_time = 0
+    
+    # Track consecutive session failures for recovery
+    consecutive_session_failures = 0
+    MAX_CONSECUTIVE_SESSION_FAILURES = 3  # After 3 failures, try full reinitialization
+    MAX_TOTAL_SESSION_RECOVERIES = 10  # Global limit to prevent infinite recovery loops
+    total_recovery_attempts = 0  # Track total recovery attempts across all keys
 
     for idx, key in enumerate(unownedgames, 1):
         # Check keep-alive periodically
@@ -2731,14 +3320,103 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         if "redeemed_key_val" not in key:
             # Validate session before redemption
             if not validate_session(humble_session):
-                print(f"  -> Session invalid, attempting recovery...")
-                if not refresh_page_if_needed(humble_session, "https://www.humblebundle.com/home/library"):
-                    print(f"  -> Failed to recover session, marking as errored")
-                    write_key(1, key)
-                    continue
+                consecutive_session_failures += 1
+                print(f"  -> Session invalid, attempting recovery... (failure {consecutive_session_failures}/{MAX_CONSECUTIVE_SESSION_FAILURES})")
+                
+                # Try simple page refresh first
+                if refresh_page_if_needed(humble_session, "https://www.humblebundle.com/home/library"):
+                    # Success - reset failure counter
+                    consecutive_session_failures = 0
+                else:
+                    # Simple refresh failed - try full reinitialization if we've had multiple failures
+                    if consecutive_session_failures >= MAX_CONSECUTIVE_SESSION_FAILURES:
+                        new_driver, new_keepalive = _reinitialize_browser_session(
+                            humble_session, remaining, idx, total_to_redeem
+                        )
+                        
+                        if new_driver is None:
+                            # Recovery failed - mark remaining keys and exit
+                            for remaining_key in unownedgames[idx - 1:]:
+                                write_key(1, remaining_key)
+                            keepalive.disable()
+                            sys.exit(2)  # Exit code 2 = session recovery failed
+                        
+                        # Update references
+                        humble_session = new_driver
+                        keepalive = new_keepalive
+                        consecutive_session_failures = 0  # Reset counter
+                    else:
+                        # Not enough failures yet - mark this key as errored and continue
+                        print(f"  -> Failed to recover session, marking as errored")
+                        write_key(1, key)
+                        continue
+            
             redeemed_key = redeem_humble_key(humble_session, key)
             key["redeemed_key_val"] = redeemed_key
             # Worth noting this will only persist for this loop -- does not get saved to unownedgames' obj
+            
+            # Check if reveal failed - provide better error messages
+            if not redeemed_key:
+                # Check if it's a session issue
+                if not validate_session(humble_session):
+                    # Session died during redemption - increment failure counter
+                    consecutive_session_failures += 1
+                    if consecutive_session_failures >= MAX_CONSECUTIVE_SESSION_FAILURES:
+                        # Check global recovery limit to prevent infinite loops
+                        total_recovery_attempts += 1
+                        if total_recovery_attempts > MAX_TOTAL_SESSION_RECOVERIES:
+                            print(f"\n⚠️  Maximum session recovery attempts ({MAX_TOTAL_SESSION_RECOVERIES}) exceeded.")
+                            print("   Session appears to be permanently invalid. Exiting to prevent infinite loop.")
+                            for remaining_key in unownedgames[idx - 1:]:
+                                write_key(1, remaining_key)
+                            keepalive.disable()
+                            sys.exit(2)  # Exit code 2 = session recovery failed
+                        
+                        new_driver, new_keepalive = _reinitialize_browser_session(
+                            humble_session, remaining, idx, total_to_redeem
+                        )
+                        
+                        if new_driver is None:
+                            # Recovery failed - mark remaining keys and exit
+                            for remaining_key in unownedgames[idx - 1:]:
+                                write_key(1, remaining_key)
+                            keepalive.disable()
+                            sys.exit(2)
+                        
+                        # Update references
+                        humble_session = new_driver
+                        keepalive = new_keepalive
+                        consecutive_session_failures = 0
+                    else:
+                        # Mark as errored and continue
+                        print(f"  -> Session died during redemption, marking as errored")
+                        write_key(1, key)
+                        continue
+                else:
+                    # Reveal failed for non-session reasons - check if it's a Choice game
+                    # For Humble Choice games, they must be SELECTED before revealing
+                    is_choice_game = False
+                    if order_details:
+                        for order in order_details:
+                            if order.get("gamekey") == key.get("gamekey"):
+                                if "choice_url" in order.get("product", {}):
+                                    is_choice_game = True
+                                    break
+                    
+                    if is_choice_game:
+                        print(f"  -> ⚠️  Reveal failed - game may not be SELECTED in Humble Choice")
+                        print(f"     → Go to Humble Choice and ensure this game is selected")
+                        print(f"     → Then run the script again")
+                    else:
+                        print(f"  -> ⚠️  Reveal failed - check error message above")
+                    
+                    # Mark as errored so it can be retried later
+                    write_key(1, key)
+                    continue
+            
+            # Reset failure counter on successful redemption
+            if redeemed_key and redeemed_key != "EXPIRED" and valid_steam_key(redeemed_key):
+                consecutive_session_failures = 0
 
         # Handle expired keys - skip without retry
         if key["redeemed_key_val"] == "EXPIRED":
@@ -2747,13 +3425,17 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             continue
 
         if not valid_steam_key(key["redeemed_key_val"]):
-            # Most likely humble gift link
+            # Most likely humble gift link or reveal failed
+            if not key["redeemed_key_val"]:
+                print(f"  -> ⚠️  Key reveal returned empty - may need to be selected in Humble Choice")
+            else:
+                print(f"  -> Invalid key format (likely gift link or reveal error)")
             write_key(1, key)
             continue
 
         code = _redeem_steam(session, key["redeemed_key_val"])
         rate_limited_this_key = False
-        if code == 53:
+        if code == SteamErrorCode.RATE_LIMITED:
             """NOTE
             Steam seems to limit to about 50 keys/hr -- even if all 50 keys are legitimate *sigh*
             Even worse: 10 *failed* keys/hr
@@ -2796,6 +3478,26 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
     if friend_keys_skipped:
         print(f"Friend/co-op keys saved: {len(friend_keys_skipped)} (see friend_keys.csv)")
     print(f"{'='*60}\n")
+    
+    # After successful redemption, check if any Choice months are now complete
+    if order_details:
+        completed_choice_months = load_completed_choice_months()
+        newly_completed = []
+        for month in order_details:
+            if "choice_url" in month.get("product", {}):
+                month_gamekey = month.get('gamekey')
+                if month_gamekey and month_gamekey not in completed_choice_months:
+                    if is_choice_month_complete(month_gamekey, order_details):
+                        mark_choice_month_complete(month_gamekey)
+                        month_name = month.get("product", {}).get("human_name", "Unknown")
+                        newly_completed.append(month_name)
+                        logging.info(f"Marked Choice month as complete: {month_name} (gamekey: {month_gamekey})")
+        
+        if newly_completed:
+            print(f"\n✓ Marked {len(newly_completed)} Choice month(s) as complete (will skip in future runs):")
+            for name in newly_completed:
+                print(f"  • {name}")
+    
     return session
 
 
@@ -3001,7 +3703,8 @@ def humble_chooser_mode(humble_session,order_details):
         if(redeem_keys and len(try_redeem_keys) > 0):
             print("Redeeming keys now!")
             try:
-                updated_monthlies = humble_session.execute_async_script(getHumbleOrders.replace('%optional%',json.dumps(try_redeem_keys)))
+                # Pass list as proper argument instead of string replacement (prevents injection)
+                updated_monthlies = humble_session.execute_async_script(getHumbleOrders, try_redeem_keys or [])
                 if isinstance(updated_monthlies, dict) and 'error' in updated_monthlies:
                     print(f"Error fetching updated monthly data: {updated_monthlies.get('message', 'Unknown error')}")
                 else:
@@ -3012,7 +3715,7 @@ def humble_chooser_mode(humble_session,order_details):
                 print(f"Error during key redemption: {e}")
 
 
-def cls():
+def cls() -> None:
     """Clear screen (unless in auto mode to preserve logs)."""
     # Don't clear screen in auto mode - we want to preserve the log
     if not AUTO_MODE:
@@ -3020,7 +3723,7 @@ def cls():
     print_main_header()
 
 
-def print_main_header():
+def print_main_header() -> None:
     """Print script header."""
     if not AUTO_MODE:
         print("-=frimodig's Humble Bundle Helper!=- (Based on original script by FailSpy)")
@@ -3127,9 +3830,10 @@ if __name__=="__main__":
                 def execute_script():
                     try:
                         thread_started.set()  # Signal that thread has started
-                        print("[DEBUG] Thread started, executing async script", file=sys.stderr, flush=True)
-                        result[0] = driver.execute_async_script(getHumbleOrders.replace('%optional%',''))
-                        print("[DEBUG] Script execution completed", file=sys.stderr, flush=True)
+                        logging.debug("Thread started, executing async script")
+                        # Pass empty list as proper argument instead of string replacement
+                        result[0] = driver.execute_async_script(getHumbleOrders, [])
+                        logging.debug("Script execution completed")
                     except KeyboardInterrupt:
                         interrupt_event.set()
                         exception[0] = KeyboardInterrupt("Interrupted by user")
@@ -3150,7 +3854,7 @@ if __name__=="__main__":
                     sys.exit(1)
                 
                 # Wait with progress indicator and interruptible joins
-                timeout_seconds = SCRIPT_TIMEOUT + 5  # 45 seconds total
+                timeout_seconds = SCRIPT_TIMEOUT_SECONDS + 5  # Wait up to {timeout_seconds} seconds total
                 waited = 0
                 check_interval = 1  # Check every 1 second
                 last_dot = 0
@@ -3220,9 +3924,9 @@ if __name__=="__main__":
                     # Check if session is still valid
                     try:
                         if not validate_session(driver):
-                            print("[DEBUG] Session is INVALID - browser crashed or disconnected", file=sys.stderr, flush=True)
+                            logging.debug("Session is INVALID - browser crashed or disconnected")
                         else:
-                            print("[DEBUG] Session is still valid - JavaScript execution is stuck", file=sys.stderr, flush=True)
+                            logging.debug("Session is still valid - JavaScript execution is stuck")
                     except:
                         print("[DEBUG] Could not validate session", file=sys.stderr, flush=True)
                     
@@ -3464,6 +4168,13 @@ The error details have been logged for debugging.
 
         # Auto-Redeem mode
         cls()
+        
+        # Initialize duplicate detection cache early for better UX
+        # This prevents a noticeable pause on the first write operation
+        print("Initializing duplicate detection cache...", end=" ", flush=True)
+        _initialize_keys_cache()
+        print("OK")
+        
         unrevealed_keys = []
         revealed_keys = []
         steam_keys = list(find_dict_keys(order_details,"steam_app_id",True))
@@ -3489,7 +4200,7 @@ The error details have been logged for debugging.
             steam_keys = non_friend_keys
 
         # Load keys that should be excluded (already processed successfully)
-        exclude_filters = ["already_owned.csv", "redeemed.csv", "expired.csv", "friend_keys.csv"]
+        exclude_filters = CSVFiles.get_exclusion_filters()
         original_length = len(steam_keys)
         for filter_file in exclude_filters:
             try:
@@ -3506,7 +4217,7 @@ The error details have been logged for debugging.
         # IMPORTANT: Match by BOTH gamekey AND name to avoid issues with shared gamekeys (Choice months)
         problematic_keys = []
         problematic_by_name = set()  # Track by (gamekey, name) for exact matching
-        errored_file = "errored.csv"
+        errored_file = CSVFiles.ERRORED
         if os.path.exists(errored_file):
             try:
                 with open(errored_file, "r", encoding="utf-8-sig") as f:
@@ -3571,6 +4282,145 @@ The error details have been logged for debugging.
         print(
             f"{len(steam_keys)} Steam keys total -- {len(revealed_keys)} revealed, {len(unrevealed_keys)} unrevealed"
         )
+        
+        # Check for unrevealed Choice games that need to be selected first
+        unrevealed_choice_games = []
+        if unrevealed_keys and order_details:
+            # Create a requests session for Choice API calls
+            request_session = requests.Session()
+            for cookie in driver.get_cookies():
+                request_session.cookies.set(
+                    cookie['name'],
+                    cookie['value'],
+                    domain=cookie['domain'].replace('www.', ''),
+                    path=cookie['path']
+                )
+            
+            # Find Choice months with unselected games
+            choice_months = [
+                month for month in order_details 
+                if "choice_url" in month.get("product", {})
+            ]
+            
+            # Load completed Choice months to skip already-processed ones
+            completed_choice_months = load_completed_choice_months()
+            
+            # Filter out completed months
+            incomplete_months = [
+                month for month in choice_months
+                if month.get('gamekey') not in completed_choice_months
+            ]
+            
+            skipped_count = len(choice_months) - len(incomplete_months)
+            if skipped_count > 0:
+                print(f"Skipping {skipped_count} already-completed Choice month(s)")
+            
+            # Process Choice months with timeout protection
+            print(f"Checking {len(incomplete_months)} Choice months for unselected games...")
+            for idx, month in enumerate(incomplete_months, 1):
+                month_name = month.get("product", {}).get("human_name", f"Month {idx}")
+                try:
+                    # Add timeout protection - get_month_data can hang
+                    print(f"  [{idx}/{len(incomplete_months)}] Checking {month_name}...", end=" ", flush=True)
+                    try:
+                        month["choice_data"] = get_month_data(request_session, month)
+                        print("✓")
+                    except Exception as data_err:
+                        print(f"✗ (skipped: {str(data_err)[:50]})")
+                        logging.debug(f"Error getting month data for {month_name}: {data_err}")
+                        continue
+                    
+                    if not month["choice_data"].get('canRedeemGames', True):
+                        continue
+                    
+                    chosen_games = set(find_dict_keys(month.get("tpkd_dict", {}), "machine_name"))
+                    v3 = not month["choice_data"].get("usesChoices", True)
+                    
+                    if v3:
+                        choice_options = month["choice_data"]["contentChoiceData"]["game_data"]
+                    else:
+                        identifier = "initial" if "initial" in month["choice_data"]["contentChoiceData"] else "initial-classic"
+                        if identifier not in month["choice_data"]["contentChoiceData"]:
+                            for key in month["choice_data"]["contentChoiceData"].keys():
+                                if "content_choices" in month["choice_data"]["contentChoiceData"][key]:
+                                    identifier = key
+                                    break
+                        choice_options = month["choice_data"]["contentChoiceData"][identifier]["content_choices"]
+                    
+                    # Find unrevealed Choice games that match unrevealed keys
+                    for game_key in unrevealed_keys:
+                        gamekey = game_key.get("gamekey", "")
+                        if gamekey == month.get("gamekey", ""):
+                            # This is a Choice month key
+                            machine_name = game_key.get("machine_name", "")
+                            if machine_name:
+                                # Check if game is already selected (in tpkd_dict)
+                                is_selected = machine_name in chosen_games
+                                
+                                if not is_selected:
+                                    # Game is NOT selected - needs selection first
+                                    # Check if this game is available in choices
+                                    for choice_key, choice_data in choice_options.items():
+                                        choice_machine_names = set(find_dict_keys(choice_data, "machine_name"))
+                                        if machine_name in choice_machine_names:
+                                            unrevealed_choice_games.append({
+                                                'month': month,
+                                                'game': game_key,
+                                                'choice_to_select': choice_data,
+                                                'identifier': identifier if not v3 else "initial",
+                                                'needs_selection': True
+                                            })
+                                            break
+                                # If is_selected is True, the game is already selected and just needs reveal
+                                # (will be handled normally by redeem_steam_keys)
+                except Exception as e:
+                    # Skip months that fail to load
+                    print(f"✗ Error: {str(e)[:50]}")
+                    logging.debug(f"Error checking Choice month {month.get('product', {}).get('human_name', 'Unknown')}: {e}")
+                    continue
+            
+            if unrevealed_choice_games:
+                print(f"\n✓ Found {len(unrevealed_choice_games)} games that need selection")
+            else:
+                print("\n✓ No unselected Choice games found")
+        
+        # Auto-select unrevealed Choice games if found
+        if unrevealed_choice_games:
+            print(f"\n⚠️  Found {len(unrevealed_choice_games)} unrevealed Humble Choice games that need to be SELECTED first")
+            auto_select = prompt_yes_no("Would you like to automatically select these games? (Recommended)", default_yes=True)
+            if auto_select:
+                print("\nAuto-selecting unrevealed Choice games...")
+                for item in unrevealed_choice_games:
+                    month = item['month']
+                    game = item['game']
+                    choice_to_select = item['choice_to_select']
+                    identifier = item['identifier']
+                    
+                    try:
+                        choice_month_name = month.get("product", {}).get("choice_url", "")
+                        choose_games(driver, choice_month_name, identifier, [choice_to_select])
+                        print(f"  ✓ Selected: {game.get('human_name', 'Unknown')}")
+                        time.sleep(1)  # Brief pause between selections
+                    except Exception as e:
+                        print(f"  ✗ Failed to select {game.get('human_name', 'Unknown')}: {e}")
+                        logging.debug(f"Error selecting Choice game: {e}", exc_info=True)
+                
+                # Refresh order details after selections
+                print("\nRefreshing order details after selections...")
+                try:
+                    # Pass empty list as proper argument instead of string replacement
+                    order_details = driver.execute_async_script(getHumbleOrders, [])
+                    if isinstance(order_details, dict) and 'error' in order_details:
+                        print(f"Warning: Error refreshing orders: {order_details.get('message', 'Unknown error')}")
+                    else:
+                        # Re-filter unrevealed keys with updated data
+                        steam_keys = list(find_dict_keys(order_details, "steam_app_id", True))
+                        unrevealed_keys = [key for key in steam_keys if "redeemed_key_val" not in key]
+                        revealed_keys = [key for key in steam_keys if "redeemed_key_val" in key]
+                        print(f"✓ Updated: {len(revealed_keys)} revealed, {len(unrevealed_keys)} unrevealed")
+                except Exception as e:
+                    print(f"Warning: Could not refresh order details: {e}")
+                    logging.debug(f"Error refreshing orders: {e}", exc_info=True)
 
         will_reveal_keys = prompt_yes_no("Would you like to redeem on Humble as-yet un-revealed Steam keys?"
                                     " (Revealing keys removes your ability to generate gift links for them)", default_yes=True)
@@ -3592,9 +4442,9 @@ The error details have been logged for debugging.
             # IMPORTANT: Deduplicate entries - prefer valid keys over empty/invalid ones
             errored_dict = {}  # gamekey -> key_val (fallback for games without name match)
             errored_by_name = {}  # (gamekey, name) -> key_val (preferred - exact match)
-            if os.path.exists("errored.csv"):
+            if os.path.exists(CSVFiles.ERRORED):
                 try:
-                    with open("errored.csv", "r", encoding="utf-8-sig") as f:
+                    with open(CSVFiles.ERRORED, "r", encoding=CSV_ENCODING) as f:
                         reader = csv.reader(f)
                         first_row = next(reader, None)
                         if first_row and first_row[0].lower() != "gamekey":
@@ -3704,7 +4554,7 @@ The error details have been logged for debugging.
                         continue
                     
                     code = _redeem_steam(steam_session, key["redeemed_key_val"])
-                    if code == 53:
+                    if code == SteamErrorCode.RATE_LIMITED:
                         # Use reusable rate limit handler
                         code = wait_for_rate_limit_clear(
                             steam_session,
