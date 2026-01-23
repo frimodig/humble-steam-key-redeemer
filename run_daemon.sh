@@ -4,20 +4,35 @@
 
 set -euo pipefail  # Exit on error, undefined variables, pipe failures
 
+# Version information
+readonly VERSION="1.0.0"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Configuration
-LOG_FILE="daemon.log"
-PID_FILE="daemon.pid"
-LOCK_FILE="daemon.lock"
-MAX_RETRIES=100      # Max restarts before giving up
-RETRY_DELAY=30       # Seconds to wait between restarts
-HEALTH_CHECK_INTERVAL=300  # Check if process is alive every 5 minutes
-MAX_LOG_SIZE=10485760  # 10MB - rotate log if larger
+# Configuration (readonly constants)
+readonly LOG_FILE="daemon.log"
+readonly PID_FILE="daemon.pid"
+readonly LOCK_FILE="daemon.lock"
+readonly STARTUP_LOG="daemon.startup.log"
+readonly MAX_RETRIES=100      # Max restarts before giving up
+readonly RETRY_DELAY=30       # Seconds to wait between restarts
+readonly HEALTH_CHECK_INTERVAL=300  # Check if process is alive every 5 minutes
+readonly MAX_LOG_SIZE=10485760  # 10MB - rotate log if larger
+readonly MAX_LOG_ROTATIONS=5  # Keep last 5 rotated logs
+
+# Cookie file names (readonly constants)
+readonly HUMBLE_COOKIES=".humblecookies"
+readonly STEAM_COOKIES=".steamcookies"
 
 # Allow timeout override via environment variable
 SCRIPT_TIMEOUT="${HUMBLE_DAEMON_TIMEOUT:-7200}"  # Default 2 hours (configurable via env)
+
+# Validate SCRIPT_TIMEOUT is a positive integer
+if ! [[ "$SCRIPT_TIMEOUT" =~ ^[0-9]+$ ]] || [ "$SCRIPT_TIMEOUT" -le 0 ]; then
+    echo "Error: HUMBLE_DAEMON_TIMEOUT must be a positive integer (got: '${HUMBLE_DAEMON_TIMEOUT:-unset}')" >&2
+    exit 1
+fi
 
 # Colors for terminal output
 RED='\033[0;31m'
@@ -33,11 +48,18 @@ cleanup() {
     if [ -f "$LOCK_FILE" ]; then
         rm -f "$LOCK_FILE"
     fi
+    # Clean up startup log if it exists (from background start attempts)
+    if [ -f "$STARTUP_LOG" ]; then
+        rm -f "$STARTUP_LOG"
+    fi
     exit $exit_code
 }
 
-# Set trap for cleanup
-trap cleanup EXIT INT TERM
+# Set trap for cleanup and signal handling
+trap cleanup EXIT
+trap 'echo "Interrupted"; exit 130' INT
+trap 'echo "Terminated"; exit 143' TERM
+trap 'echo "Hangup"; exit 129' HUP
 
 # Logging functions
 log() {
@@ -70,7 +92,7 @@ success() {
 
 usage() {
     cat << EOF
-Humble Steam Key Redeemer Daemon
+Humble Steam Key Redeemer Daemon v${VERSION}
 
 Usage: $0 [options]
 
@@ -216,10 +238,14 @@ rotate_log() {
         local size=$(get_file_size "$LOG_FILE")
         if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
             log "Rotating log file (size: $size bytes)"
-            mv "$LOG_FILE" "${LOG_FILE}.old"
-            # Keep only last rotation
-            [ -f "${LOG_FILE}.old.1" ] && rm -f "${LOG_FILE}.old.1"
-            [ -f "${LOG_FILE}.old" ] && mv "${LOG_FILE}.old" "${LOG_FILE}.old.1"
+            # Remove oldest rotation if we've reached max
+            [ -f "${LOG_FILE}.old.$MAX_LOG_ROTATIONS" ] && rm -f "${LOG_FILE}.old.$MAX_LOG_ROTATIONS"
+            # Shift existing rotations
+            for i in $(seq $((MAX_LOG_ROTATIONS - 1)) -1 1); do
+                [ -f "${LOG_FILE}.old.$i" ] && mv "${LOG_FILE}.old.$i" "${LOG_FILE}.old.$((i + 1))"
+            done
+            # Move current log to .old.1
+            mv "$LOG_FILE" "${LOG_FILE}.old.1"
         fi
     fi
 }
@@ -228,7 +254,8 @@ rotate_log() {
 count_file() {
     if [ -f "$1" ]; then
         # Count non-empty lines, skip header if present
-        local count=$(tail -n +2 "$1" 2>/dev/null | grep -c . 2>/dev/null || echo "0")
+        # Use wc -l for efficiency (doesn't read entire file into memory)
+        local count=$(tail -n +2 "$1" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
         echo "$count"
     else
         echo "0"
@@ -290,8 +317,9 @@ is_running() {
     
     # Check if process exists and is our script
     if ps -p "$pid" > /dev/null 2>&1; then
-        # Verify it's actually our daemon (check for both scripts)
-        if ps -p "$pid" -o command= 2>/dev/null | grep -q "humblesteamkeysredeemer.py\|run_daemon.sh"; then
+        # Verify it's actually our daemon (check for exact command patterns)
+        local cmd=$(ps -p "$pid" -o command= 2>/dev/null)
+        if [[ "$cmd" == *"run_daemon.sh --internal"* ]] || [[ "$cmd" == *"humblesteamkeysredeemer.py --auto"* ]]; then
             return 0
         fi
     fi
@@ -341,16 +369,16 @@ show_status() {
     echo "║  Files:                               ║"
     
     # Check for session files
-    if [ -f ".humblecookies" ]; then
-        local age=$(get_file_age ".humblecookies")
+    if [ -f "$HUMBLE_COOKIES" ]; then
+        local age=$(get_file_age "$HUMBLE_COOKIES")
         local days=$((age / 86400))
         echo -e "║  Humble:    ${GREEN}✓${NC} (${days}d old)               ║"
     else
         echo -e "║  Humble:    ${RED}✗ Missing${NC}                 ║"
     fi
     
-    if [ -f ".steamcookies" ]; then
-        local age=$(get_file_age ".steamcookies")
+    if [ -f "$STEAM_COOKIES" ]; then
+        local age=$(get_file_age "$STEAM_COOKIES")
         local days=$((age / 86400))
         echo -e "║  Steam:     ${GREEN}✓${NC} (${days}d old)               ║"
     else
@@ -402,27 +430,63 @@ stop_daemon() {
     fi
 }
 
+# Check file permissions for sensitive files
+check_file_permissions() {
+    for file in "$HUMBLE_COOKIES" "$STEAM_COOKIES"; do
+        if [ -f "$file" ]; then
+            # Get file permissions (works on both Linux and macOS)
+            local perms
+            if stat -c %a "$file" >/dev/null 2>&1; then
+                # Linux
+                perms=$(stat -c %a "$file")
+            elif stat -f %Lp "$file" >/dev/null 2>&1; then
+                # macOS
+                perms=$(stat -f %Lp "$file")
+            else
+                # Fallback - use ls
+                perms=$(ls -l "$file" | awk '{print $1}' | sed 's/^...\(...\).*/\1/')
+            fi
+            
+            # Check if permissions are too open (should be 600)
+            if [ "$perms" != "600" ] && [ "$perms" != "0600" ]; then
+                warning "$file has insecure permissions: $perms (should be 600)"
+            fi
+        fi
+    done
+}
+
+# Check disk space
+check_disk_space() {
+    local available
+    if df -k "$SCRIPT_DIR" >/dev/null 2>&1; then
+        available=$(df -k "$SCRIPT_DIR" | tail -1 | awk '{print $4}')
+        if [ "$available" -lt 10240 ]; then  # Less than 10MB
+            warning "Low disk space: ${available}KB available"
+        fi
+    fi
+}
+
 # Check for existing sessions
 check_sessions() {
     local missing=false
     
-    if [ ! -f ".humblecookies" ]; then
-        warning "No Humble session found (.humblecookies missing)"
+    if [ ! -f "$HUMBLE_COOKIES" ]; then
+        warning "No Humble session found ($HUMBLE_COOKIES missing)"
         missing=true
     else
         # Check if cookies are stale (older than 30 days)
-        local age=$(get_file_age ".humblecookies")
+        local age=$(get_file_age "$HUMBLE_COOKIES")
         if [ "$age" -gt 2592000 ]; then  # 30 days
             warning "Humble session is quite old ($(($age / 86400)) days)"
         fi
     fi
     
-    if [ ! -f ".steamcookies" ]; then
-        warning "No Steam session found (.steamcookies missing)"
+    if [ ! -f "$STEAM_COOKIES" ]; then
+        warning "No Steam session found ($STEAM_COOKIES missing)"
         missing=true
     else
         # Check if cookies are stale (older than 30 days)
-        local age=$(get_file_age ".steamcookies")
+        local age=$(get_file_age "$STEAM_COOKIES")
         if [ "$age" -gt 2592000 ]; then  # 30 days
             warning "Steam session is quite old ($(($age / 86400)) days)"
         fi
@@ -474,6 +538,8 @@ release_lock() {
 monitor_health() {
     local pid=$1
     local last_size=0
+    local inactive_checks=0
+    local max_inactive_checks=3  # Warn after 3 inactive checks (15 minutes)
     
     log_no_tee "Health monitor started for PID $pid"
     
@@ -484,8 +550,15 @@ monitor_health() {
         if [ -f "$LOG_FILE" ]; then
             local current_size=$(get_file_size "$LOG_FILE")
             if [ "$current_size" -eq "$last_size" ]; then
-                log_no_tee "Health check: No log activity in last ${HEALTH_CHECK_INTERVAL}s (may be normal)"
+                inactive_checks=$((inactive_checks + 1))
+                if [ $inactive_checks -ge $max_inactive_checks ]; then
+                    local inactive_time=$((HEALTH_CHECK_INTERVAL * inactive_checks))
+                    log_no_tee "WARNING: No activity for ${inactive_time}s - possible hang"
+                else
+                    log_no_tee "Health check: No log activity in last ${HEALTH_CHECK_INTERVAL}s (may be normal)"
+                fi
             else
+                inactive_checks=0  # Reset counter on activity
                 log_no_tee "Health check: Process active (log growing)"
             fi
             last_size=$current_size
@@ -588,8 +661,8 @@ run_daemon() {
                 # Stop health monitor gracefully
                 if ps -p $health_pid > /dev/null 2>&1; then
                     kill -TERM $health_pid 2>/dev/null || true
-                    # Give it 2 seconds to exit gracefully
-                    local timeout=20
+                    # Give it 2 seconds to exit gracefully (200 × 0.1s = 20 seconds)
+                    local timeout=200
                     while ps -p $health_pid > /dev/null 2>&1 && [ $timeout -gt 0 ]; do
                         sleep 0.1
                         timeout=$((timeout - 1))
@@ -629,8 +702,8 @@ run_daemon() {
     # Stop health monitor gracefully
     if ps -p $health_pid > /dev/null 2>&1; then
         kill -TERM $health_pid 2>/dev/null || true
-        # Give it 2 seconds to exit gracefully
-        local timeout=20
+        # Give it 2 seconds to exit gracefully (200 × 0.1s = 20 seconds)
+        local timeout=200
         while ps -p $health_pid > /dev/null 2>&1 && [ $timeout -gt 0 ]; do
             sleep 0.1
             timeout=$((timeout - 1))
@@ -737,6 +810,10 @@ done
 # Check prerequisites
 check_prerequisites
 
+# Check disk space and file permissions (non-fatal warnings)
+check_disk_space
+check_file_permissions
+
 # Status mode - show status and exit
 if [ "$SHOW_STATUS" = true ]; then
     show_status
@@ -804,32 +881,44 @@ if [ "$BACKGROUND" = true ]; then
     
     # Start in background using nohup and properly detach
     # Use separate startup log to avoid double-logging conflicts
-    nohup "$SCRIPT_DIR/$(basename "$0")" --internal </dev/null >daemon.startup.log 2>&1 &
+    nohup "$SCRIPT_DIR/$(basename "$0")" --internal </dev/null >"$STARTUP_LOG" 2>&1 &
     local daemon_pid=$!
     disown $daemon_pid 2>/dev/null || true
     
-    # Wait a moment to see if it starts successfully
-    sleep 2
-    
-    if ps -p $daemon_pid > /dev/null 2>&1; then
-        success "Daemon started! (PID: $daemon_pid)"
-        
-        # Check startup log for immediate errors
-        if [ -f "daemon.startup.log" ] && grep -qi "error\|failed\|traceback" daemon.startup.log; then
-            warning "Startup log contains errors - check daemon.startup.log"
+    # Wait for PID file to be created (more reliable than checking process)
+    local wait_time=0
+    local max_wait=10  # Wait up to 5 seconds (10 × 0.5s)
+    while [ $wait_time -lt $max_wait ]; do
+        if [ -f "$PID_FILE" ]; then
+            local actual_pid=$(cat "$PID_FILE" 2>/dev/null)
+            if [ -n "$actual_pid" ] && ps -p "$actual_pid" > /dev/null 2>&1; then
+                success "Daemon started! (PID: $actual_pid)"
+                
+                # Check startup log for immediate errors
+                if [ -f "$STARTUP_LOG" ] && grep -qi "error\|failed\|traceback" "$STARTUP_LOG"; then
+                    warning "Startup log contains errors - check $STARTUP_LOG"
+                fi
+                
+                # Clean up startup log after successful start
+                rm -f "$STARTUP_LOG"
+                
+                show_stats
+                exit 0
+            fi
         fi
-        
-        show_stats
-    else
-        error "Daemon failed to start. Check logs for details."
-        echo ""
-        echo "=== Startup Log ==="
-        [ -f "daemon.startup.log" ] && tail -20 "daemon.startup.log" || echo "(No startup log found)"
-        echo ""
-        echo "=== Main Log ==="
-        [ -f "$LOG_FILE" ] && tail -20 "$LOG_FILE" || echo "(No main log found)"
-        exit 1
-    fi
+        sleep 0.5
+        wait_time=$((wait_time + 1))
+    done
+    
+    # If we get here, daemon didn't start properly
+    error "Daemon failed to start within $((max_wait / 2)) seconds. Check logs for details."
+    echo ""
+    echo "=== Startup Log ==="
+    [ -f "$STARTUP_LOG" ] && tail -20 "$STARTUP_LOG" || echo "(No startup log found)"
+    echo ""
+    echo "=== Main Log ==="
+    [ -f "$LOG_FILE" ] && tail -20 "$LOG_FILE" || echo "(No main log found)"
+    exit 1
     
     exit 0
 fi
