@@ -2484,19 +2484,20 @@ def prompt_skipped(skipped_games):
         for skipped_game in skipped_games.keys():
             file.write(skipped_game + "\n")
 
-    print(
-        f"Inside skipped.txt is a list of {len(skipped_games)} games that we think you already own, but aren't "
-        f"completely sure "
-    )
     if AUTO_MODE:
-        print("(auto-mode: skipping all uncertain games)")
+        print(f"Found {len(skipped_games)} games with uncertain ownership (auto-mode: skipping all)")
         # In auto mode, skip all uncertain games (safer)
         if os.path.exists("skipped.txt"):
             os.remove("skipped.txt")
         return []
+    
+    print(
+        f"Found {len(skipped_games)} games that we think you already own, but aren't completely sure."
+    )
+    print(f"A temporary file 'skipped.txt' has been created with these games.")
     try:
         input(
-            "Feel free to REMOVE from that list any games that you would like to try anyways, and when done press "
+            "Feel free to REMOVE from that file any games that you would like to try anyway, and when done press "
             "Enter to confirm. "
         )
     except (KeyboardInterrupt, EOFError):
