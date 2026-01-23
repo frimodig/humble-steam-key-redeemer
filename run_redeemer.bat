@@ -4,6 +4,17 @@ setlocal enabledelayedexpansion
 REM ============================================================================
 REM Humble Steam Key Redeemer - Windows Launcher
 REM ============================================================================
+REM Version: 1.3.0
+REM
+REM Limitations compared to bash daemon script:
+REM - No true daemon mode (use Task Scheduler for background execution)
+REM - No health monitoring (batch script limitations)
+REM - No automatic retry logic (Task Scheduler better suited for this)
+REM - Lock file uses pseudo-PID (batch can't easily get real process PID)
+REM
+REM For daemon-like functionality, use Windows Task Scheduler:
+REM   schtasks /create /tn "HumbleKeyRedeemer" /tr "C:\path\to\run.bat --auto" /sc daily /st 03:00
+REM ============================================================================
 set "VERSION=1.3.0"
 
 REM ============================================================================
@@ -504,8 +515,10 @@ echo.
 REM Use PowerShell to get last N lines (more reliable than batch)
 powershell -Command "if (Test-Path '%LOG_FILE%') { Get-Content -Path '%LOG_FILE%' -Tail %LINES% } else { Write-Host 'Log file not found' }" 2>nul
 if errorlevel 1 (
-    REM Fallback: use more command (if available)
-    more +%LINES% "%LOG_FILE%" 2>nul
+    REM Fallback: show entire file if PowerShell not available or failed
+    echo %YELLOW%[WARNING]%RESET% PowerShell not available, showing entire log:
+    echo.
+    type "%LOG_FILE%" 2>nul
     if errorlevel 1 (
         echo %YELLOW%[WARNING]%RESET% Could not read log file
     )
