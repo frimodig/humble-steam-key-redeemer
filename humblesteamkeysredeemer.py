@@ -535,8 +535,8 @@ def refresh_page_if_needed(driver, url=None):
             driver.refresh()
         time.sleep(DEFAULT_SLEEP_SECONDS)
         return True
-    except Exception as e:
-        print(f"[DEBUG] Failed to refresh page: {e}")
+    except Exception:
+        # Session is dead - return False silently (caller will handle recovery)
         return False
 
 
@@ -2606,6 +2606,39 @@ def _save_cache(cache_key: str, data: Any) -> bool:
         return False
 
 
+def _load_known_owned_apps() -> set:
+    """
+    Load set of app IDs that Steam has told us we already own.
+    These are discovered during redemption attempts (error code 9).
+    """
+    cached_data, is_valid = _load_cache("known_owned_apps", max_age_hours=24*365)  # Cache for 1 year
+    if is_valid and isinstance(cached_data, list):
+        return set(cached_data)
+    return set()
+
+
+def _save_known_owned_apps(app_ids: set) -> bool:
+    """
+    Save set of app IDs that Steam has told us we already own.
+    """
+    return _save_cache("known_owned_apps", list(app_ids))
+
+
+def _add_known_owned_app(app_id):
+    """
+    Add an app ID to the known owned apps cache.
+    Thread-safe wrapper around cache operations.
+    """
+    if not app_id:
+        return
+    
+    with _CACHE_LOCK:
+        known_owned = _load_known_owned_apps()
+        if app_id not in known_owned:
+            known_owned.add(app_id)
+            _save_known_owned_apps(known_owned)
+
+
 def _load_steam_api_key(path: str = "steam_api_key.txt") -> str:
     """
     Load Steam API key from file or prompt user.
@@ -2983,6 +3016,9 @@ def retry_errored_keys(humble_session, steam_session, order_details):
     """Retry keys that previously errored (especially rate-limited ones)."""
     if order_details is None:
         return  # Can't retry without order details
+    
+    # Load known owned apps cache
+    known_owned_app_ids = _load_known_owned_apps()
     errored_file = CSVFiles.ERRORED
     if not os.path.exists(errored_file):
         return
@@ -3107,7 +3143,19 @@ def retry_errored_keys(humble_session, steam_session, order_details):
         if not valid_steam_key(key["redeemed_key_val"]):
             print(f"  -> Invalid key format, skipping")
             continue
+        
+        # Check known owned apps cache before attempting redemption
+        steam_app_id = key.get("steam_app_id")
+        if steam_app_id and steam_app_id in known_owned_app_ids:
+            print(f"  -> Skipping (previously identified as already owned by Steam)")
+            write_key(SteamErrorCode.ALREADY_OWNED, key)
+            continue
+        
         code = _redeem_steam(steam_session, key["redeemed_key_val"])
+        
+        # If Steam tells us we already own this, cache the app ID for future runs
+        if code == SteamErrorCode.ALREADY_OWNED and steam_app_id:
+            _add_known_owned_app(steam_app_id)
         if code == SteamErrorCode.RATE_LIMITED:
             # Use reusable rate limit handler
             code = wait_for_rate_limit_clear(
@@ -3144,7 +3192,7 @@ class SessionKeepAlive:
                     _ = self.driver.title  # Lightweight operation
                     self.last_keepalive = current_time
                 else:
-                    print(f"[DEBUG] Session validation failed during keep-alive")
+                    # Session died - silently disable keep-alive
                     self.enabled = False
             except Exception:
                 self.enabled = False
@@ -3240,6 +3288,11 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
 
     # Query owned App IDs according to Steam
     owned_app_details = get_owned_apps(session)
+    
+    # Load app IDs that Steam has told us we already own (discovered during previous redemption attempts)
+    known_owned_app_ids = _load_known_owned_apps()
+    if known_owned_app_ids:
+        print(f"Found {len(known_owned_app_ids)} app(s) previously identified as already owned by Steam")
 
     # Ask user if they want to skip friend/co-op keys
     skip_friend_keys = prompt_yes_no(
@@ -3276,6 +3329,11 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
         # Check if revealed and owned
         is_revealed = "redeemed_key_val" in key
         steam_app_id = key.get("steam_app_id")
+        
+        # Check known owned apps cache first (app IDs Steam told us we own)
+        if steam_app_id and steam_app_id in known_owned_app_ids:
+            skipped_games[key['human_name'].strip()] = key
+            continue
         
         if is_revealed and steam_app_id in owned_app_details.keys():
             # Definitely owned (exact AppID match)
@@ -3484,7 +3542,19 @@ def redeem_steam_keys(humble_session, humble_keys, order_details=None):
             write_key(1, key)
             continue
 
+        # Check known owned apps cache before attempting redemption
+        steam_app_id = key.get("steam_app_id")
+        if steam_app_id and steam_app_id in known_owned_app_ids:
+            print(f"  -> Skipping (previously identified as already owned by Steam)")
+            write_key(SteamErrorCode.ALREADY_OWNED, key)
+            continue
+        
         code = _redeem_steam(session, key["redeemed_key_val"])
+        
+        # If Steam tells us we already own this, cache the app ID for future runs
+        if code == SteamErrorCode.ALREADY_OWNED and steam_app_id:
+            _add_known_owned_app(steam_app_id)
+        
         rate_limited_this_key = False
         if code == SteamErrorCode.RATE_LIMITED:
             """NOTE
@@ -4547,6 +4617,8 @@ The error details have been logged for debugging.
             print(f"\n{'='*60}")
             print(f"Retrying {len(problematic_keys)} previously problematic keys (trying last)...")
             print(f"{'='*60}\n")
+            # Load known owned apps cache once
+            known_owned_app_ids = _load_known_owned_apps()
             # Load the redeemed_key_val from errored.csv for these keys
             # IMPORTANT: Match by both gamekey AND name to avoid issues with shared gamekeys (Choice months)
             # IMPORTANT: Deduplicate entries - prefer valid keys over empty/invalid ones
@@ -4663,7 +4735,18 @@ The error details have been logged for debugging.
                         print(f"  -> Invalid key format, skipping")
                         continue
                     
+                    # Check known owned apps cache before attempting redemption
+                    steam_app_id = key.get("steam_app_id")
+                    if steam_app_id and steam_app_id in known_owned_app_ids:
+                        print(f"  -> Skipping (previously identified as already owned by Steam)")
+                        write_key(SteamErrorCode.ALREADY_OWNED, key)
+                        continue
+                    
                     code = _redeem_steam(steam_session, key["redeemed_key_val"])
+                    
+                    # If Steam tells us we already own this, cache the app ID for future runs
+                    if code == SteamErrorCode.ALREADY_OWNED and steam_app_id:
+                        _add_known_owned_app(steam_app_id)
                     if code == SteamErrorCode.RATE_LIMITED:
                         # Use reusable rate limit handler
                         code = wait_for_rate_limit_clear(
