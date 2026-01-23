@@ -372,8 +372,14 @@ def setup_logging():
         def __init__(self, logger):
             self.logger = logger
             self.buffer = []
+            self._logging = False  # Flag to prevent recursive logging
         
         def write(self, message):
+            # Prevent recursive logging - if we're already logging, write directly to original stderr
+            if self._logging:
+                sys.__stderr__.write(message)
+                return
+            
             # Buffer messages to handle multi-line output
             if message and message != '\n':
                 self.buffer.append(message)
@@ -381,27 +387,57 @@ def setup_logging():
                     full_message = ''.join(self.buffer).strip()
                     self.buffer = []
                     if full_message:
-                        self._log_with_level(full_message)
+                        # Skip messages that are already formatted log messages to prevent loops
+                        if full_message.startswith(('ERROR:', 'WARNING:', 'INFO:', 'DEBUG:')):
+                            sys.__stderr__.write(full_message + '\n')
+                        else:
+                            self._log_with_level(full_message)
         
         def _log_with_level(self, message):
             """Detect log level from message content."""
-            msg_lower = message.lower()
-            if any(x in msg_lower for x in ['error', 'exception', 'failed', 'fail', 'traceback']):
-                self.logger.error(message)
-            elif any(x in msg_lower for x in ['warning', 'warn']):
-                self.logger.warning(message)
-            elif any(x in msg_lower for x in ['debug', '[debug]']):
-                self.logger.debug(message)
-            else:
-                # Default to warning for stderr (since it's usually important)
-                self.logger.warning(message)
+            # Prevent recursive logging
+            if self._logging:
+                sys.__stderr__.write(message + '\n')
+                return
+            
+            self._logging = True
+            try:
+                msg_lower = message.lower()
+                # Skip if message is already a formatted log message
+                if message.startswith(('ERROR:', 'WARNING:', 'INFO:', 'DEBUG:')):
+                    sys.__stderr__.write(message + '\n')
+                    return
+                
+                # Skip traceback/stack frames to prevent recursion
+                if any(x in message for x in ['File "/', 'File "<', 'line ', 'in _log', 'in handle', 'in emit', 'in flush']):
+                    sys.__stderr__.write(message + '\n')
+                    return
+                
+                if any(x in msg_lower for x in ['error', 'exception', 'failed', 'fail', 'traceback']):
+                    self.logger.error(message)
+                elif any(x in msg_lower for x in ['warning', 'warn']):
+                    self.logger.warning(message)
+                elif any(x in msg_lower for x in ['debug', '[debug]']):
+                    self.logger.debug(message)
+                else:
+                    # Default to warning for stderr (since it's usually important)
+                    self.logger.warning(message)
+            finally:
+                self._logging = False
         
         def flush(self):
+            # Don't log from flush() - just write buffer directly to stderr to prevent recursion
+            # flush() is called by logging handlers, so we can't log from here
             if self.buffer:
                 full_message = ''.join(self.buffer).strip()
                 if full_message:
-                    self._log_with_level(full_message)
+                    sys.__stderr__.write(full_message + '\n')
                 self.buffer = []
+            # Also flush the original stderr
+            try:
+                sys.__stderr__.flush()
+            except:
+                pass
     
     sys.stderr = LoggerWriter(logger)
 
