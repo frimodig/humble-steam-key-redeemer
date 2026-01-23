@@ -7,6 +7,26 @@
 .*cookies
 skipped.txt
 
+# Diagnostic and temporary scripts
+check_*.py
+diagnose_*.py
+export_*.py
+
+# Sensitive files
+steam_api_key.txt
+steam_api_key.txt.enc
+.cookie_encryption_key
+.cookie_encryption_key.enc
+.choice_completed.json
+
+# Temporary export files
+keys_to_share*.txt
+keys_with_names.txt
+keys_full*.csv
+friend_key_exclusions.txt
+missing_app_ids.txt
+*.csv.backup
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
