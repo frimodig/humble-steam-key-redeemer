@@ -4615,7 +4615,7 @@ The error details have been logged for debugging.
         # These keys already have redeemed_key_val from errored.csv, so we can retry them directly
         if problematic_keys:
             print(f"\n{'='*60}")
-            print(f"Retrying {len(problematic_keys)} previously problematic keys (trying last)...")
+            print(f"Checking {len(problematic_keys)} previously problematic keys for retry...")
             print(f"{'='*60}\n")
             # Load known owned apps cache once
             known_owned_app_ids = _load_known_owned_apps()
@@ -4724,6 +4724,11 @@ The error details have been logged for debugging.
                     remove_from_errored_csv(key.get("gamekey", ""), key.get("human_name", ""))
             
             if keys_to_retry:
+                # Show accurate count of keys that will actually be retried
+                filtered_out = len(problematic_keys) - len(keys_to_retry)
+                if filtered_out > 0:
+                    print(f"Filtered out {filtered_out} keys (duplicates, friend keys, missing entries, invalid keys)")
+                print(f"\nRetrying {len(keys_to_retry)} keys (trying last)...\n")
                 # Retry these keys directly (they already have redeemed_key_val)
                 total_retry = len(keys_to_retry)
                 for idx, key in enumerate(keys_to_retry, 1):
@@ -4761,7 +4766,9 @@ The error details have been logged for debugging.
                     # Write key INSIDE the for loop
                     write_key(code, key)
             else:
-                print("No valid keys found to retry from problematic keys list.")
+                filtered_out = len(problematic_keys)
+                print(f"No valid keys found to retry from {len(problematic_keys)} problematic keys.")
+                print(f"(All {filtered_out} keys were filtered out: duplicates, friend keys, missing entries, or invalid keys)")
         
         # Also retry any keys that errored during THIS run
         retry_errored_keys(driver, steam_session, order_details)
