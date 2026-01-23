@@ -4369,8 +4369,13 @@ The error details have been logged for debugging.
             
             # Process Choice months with timeout protection
             print(f"Checking {len(incomplete_months)} Choice months for unselected games...")
-            for idx, month in enumerate(incomplete_months, 1):
-                month_name = month.get("product", {}).get("human_name", f"Month {idx}")
+            skipped_no_unrevealed = 0
+            skipped_all_selected = 0
+            months_to_check = []
+            
+            # First pass: identify which months need checking
+            for month in incomplete_months:
+                month_name = month.get("product", {}).get("human_name", "Unknown")
                 month_gamekey = month.get("gamekey", "")
                 
                 # OPTIMIZATION: Check if we need to fetch month data at all
@@ -4385,7 +4390,7 @@ The error details have been logged for debugging.
                 
                 # If no unrevealed keys for this month, skip entirely
                 if not unrevealed_for_month:
-                    print(f"  [{idx}/{len(incomplete_months)}] {month_name}... ✓ (no unrevealed keys, skipping)")
+                    skipped_no_unrevealed += 1
                     continue
                 
                 # Check if all unrevealed keys are already selected
@@ -4398,8 +4403,28 @@ The error details have been logged for debugging.
                 
                 # If all unrevealed keys are already selected, skip fetching month data
                 if all_selected:
-                    print(f"  [{idx}/{len(incomplete_months)}] {month_name}... ✓ (all games selected, skipping)")
+                    skipped_all_selected += 1
                     continue
+                
+                # This month needs checking
+                months_to_check.append(month)
+            
+            # Show summary of skipped months
+            total_skipped = skipped_no_unrevealed + skipped_all_selected
+            if total_skipped > 0:
+                skip_msg = f"Skipping {total_skipped} month(s)"
+                if skipped_no_unrevealed > 0 and skipped_all_selected > 0:
+                    skip_msg += f" ({skipped_no_unrevealed} with no unrevealed keys, {skipped_all_selected} with all games selected)"
+                elif skipped_no_unrevealed > 0:
+                    skip_msg += f" ({skipped_no_unrevealed} with no unrevealed keys)"
+                elif skipped_all_selected > 0:
+                    skip_msg += f" ({skipped_all_selected} with all games selected)"
+                print(f"  {skip_msg}")
+            
+            # Now check only the months that need it
+            for idx, month in enumerate(months_to_check, 1):
+                month_name = month.get("product", {}).get("human_name", f"Month {idx}")
+                month_gamekey = month.get("gamekey", "")
                 
                 # Need to fetch month data to check for unselected games
                 try:
