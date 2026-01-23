@@ -130,15 +130,11 @@ HUMBLE_DAEMON_TIMEOUT=14400 ./run_daemon.sh --background
 - **Fixed JavaScript timeout** - Reduced to 28s to prevent conflicts with Python timeout
 - **Fixed session keep-alive** - Now works during rate-limit waits
 
-### 🛠️ Diagnostic Tools
-Several diagnostic scripts are included to help troubleshoot issues:
-
-- **`check_game.py`** - Check if a specific game has been processed and its status
-- **`check_why_not_redeemed.py`** - Detailed analysis of why a game wasn't redeemed
-- **`find_game_in_orders.py`** - Search all Humble orders for a specific game
-- **`diagnose_choice_games.py`** - Diagnose issues with Humble Choice game detection
-- **`check_unredeemed_simple.py`** - Quick analysis of cached order data
-- **`cleanup_errored_csv.py`** - Remove duplicates from `errored.csv`
+### 🎯 Choice Month Completion Tracking
+- **Automatic tracking** - Tracks completed Choice months in `.choice_completed.json`
+- **Smart skipping** - Skips months where all games are already selected and redeemed
+- **Performance optimization** - Avoids slow API calls for months with no unselected games
+- **Faster startup** - Significantly reduces startup time by skipping already-processed months
 
 ---
 
@@ -151,6 +147,8 @@ If you choose to reveal keys in this mode, it will only reveal keys that it goes
 
 **Features:**
 - Automatically reveals unredeemed Humble Choice games
+- Auto-selects unselected Choice games when needed
+- Skips already-completed Choice months (faster startup)
 - Skips friend/co-op keys (saves to `friend_keys.csv`)
 - Processes problematic keys last (from `errored.csv`)
 - Shows accurate counts including problematic keys
@@ -176,8 +174,11 @@ For those subscribed to Humble Choice, this mode will find any Humble Monthly/Ch
 | `friend_keys.csv` | Friend/co-op keys saved for gifting |
 | `skipped.txt` | Games skipped due to uncertain ownership (temporary file) |
 | `failed_orders.txt` | Orders that failed to fetch (corrupted data on Humble's side) |
+| `.choice_completed.json` | Tracks completed Choice months (skipped on future runs) |
 
-**Note:** Successfully redeemed keys are automatically removed from `errored.csv` to prevent re-retrying.
+**Notes:**
+- Successfully redeemed keys are automatically removed from `errored.csv` to prevent re-retrying
+- Choice months are automatically tracked and skipped once all games are selected and redeemed
 
 ---
 
@@ -205,10 +206,11 @@ The script requires a Steam Web API key (create one at https://steamcommunity.co
 Steam limits key redemption to approximately **50 keys per hour**. The script automatically:
 - Detects rate limiting (403 Forbidden responses)
 - Waits and retries every 5 minutes
-- Shows progress during wait periods
-- Keeps Humble session alive during long waits
+- Shows progress updates every 5 minutes (reduced verbosity for long waits)
+- Keeps Humble session alive during long waits (every 5 minutes)
 - Continues processing once the limit clears
 - Tracks rate limit statistics (count and total wait time)
+- Minimal logging during rate limit waits to reduce log spam
 
 ### Friend/Co-op Keys
 
@@ -314,29 +316,32 @@ python3 humblesteamkeysredeemer.py
 
 ---
 
-## Diagnostic Tools
+## Additional Tools
 
-The fork includes several diagnostic scripts to help troubleshoot issues:
+### Export Keys for Friends
+
+Export revealed Steam keys from `already_owned.csv` to share with friends:
 
 ```bash
-# Check if a specific game has been processed
-python3 check_game.py "Game Name"
+# Export only potentially unused keys (recommended)
+python3 export_keys_for_friends.py safe
 
-# Detailed analysis of why a game wasn't redeemed
-python3 check_why_not_redeemed.py "Game Name"
+# Export all keys with game names
+python3 export_keys_for_friends.py names
 
-# Search all Humble orders for a specific game
-python3 find_game_in_orders.py "Game Name"
-
-# Diagnose Humble Choice game detection issues
-python3 diagnose_choice_games.py
-
-# Quick analysis of cached order data
-python3 check_unredeemed_simple.py
-
-# Clean up duplicate entries in errored.csv
-python3 cleanup_errored_csv.py
+# Export full CSV with status
+python3 export_keys_for_friends.py full
 ```
+
+**Note:** This script checks `redeemed.csv` to identify potentially used keys. Keys that appear in both files may have been manually redeemed in the past. Always test keys before sharing!
+
+### Diagnostic Scripts
+
+The repository includes several diagnostic scripts for troubleshooting (not tracked in git to keep the repo clean). These can be created locally as needed:
+- Check game status and processing history
+- Analyze why games weren't redeemed
+- Diagnose Choice game detection issues
+- Clean up duplicate entries in CSV files
 
 ---
 
