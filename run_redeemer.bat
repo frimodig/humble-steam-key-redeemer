@@ -309,7 +309,7 @@ echo Running Humble Steam Key Redeemer
 echo ════════════════════════════════════════
 echo.
 
-python "%SCRIPT%"%SCRIPT_ARGS%
+python "%SCRIPT%" %SCRIPT_ARGS%
 set "EXIT_CODE=%errorlevel%"
 
 echo.
